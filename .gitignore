@@ -1,0 +1,31 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+.DS_Store
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+/.gradle
+local.properties
+.gradle/
+
+# old directory (replaced by smali-base/)
+original_v2/
+
+# generated from device_original.apk via build-apk or just prepare-smali
+smali-base/
+# app/src/main/res/ - keep tracked, needs jadx to regenerate
+
+# generated build artifacts
+build/
+dist/
+
+# IDE
+.idea/
+*.iml
+.DS_Store

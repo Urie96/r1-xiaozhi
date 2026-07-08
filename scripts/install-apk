@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# install-apk — 安装指定版本的 Janus APK 到设备
+# Usage: install-apk <version_number> [device_serial]
+# Example: install-apk 5                     → 默认 serial
+#          install-apk 5 192.168.5.9:5555     → TCP 设备
+#          install-apk 5 1234567890abcdef     → USB 设备
+# ──────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+fail() {
+  echo -e "${RED}[ERROR]${NC} $*" >&2
+  exit 1
+}
+
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+
+# ── Arguments ─────────────────────────────────
+[[ $# -lt 1 ]] && fail "Usage: $0 <version_number> [device_serial]"
+VERSION="$1"
+SERIAL="${2:-}"
+
+# ── Resolve APK path ─────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+APK_PATH="$PROJECT_DIR/dist/janus_unisound_v${VERSION}.apk"
+
+[[ -f "$APK_PATH" ]] || fail "APK not found: $APK_PATH"
+[[ -s "$APK_PATH" ]] || fail "APK is empty: $APK_PATH"
+
+info "APK:    $APK_PATH"
+
+# ── adb 前缀 ──────────────────────────────────
+ADB="adb"
+if [ -n "$SERIAL" ]; then
+  ADB="adb -s $SERIAL"
+  info "Device: $SERIAL"
+
+  # 如果 serial 是 TCP 格式 (ip:port)，先连接
+  if [[ "$SERIAL" == *:* ]]; then
+    info "Connecting to $SERIAL…"
+    adb connect "$SERIAL" 2>&1 || true
+    sleep 1
+  fi
+else
+  # 没有指定 serial，检查是否只有一个设备
+  DEVICE_LIST=$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}')
+  DEVICE_COUNT=$(echo "$DEVICE_LIST" | grep -c . || true)
+  if [ "$DEVICE_COUNT" -eq 0 ]; then
+    fail "No device connected. Try: just install $VERSION 192.168.5.9:5555"
+  elif [ "$DEVICE_COUNT" -gt 1 ]; then
+    fail "Multiple devices found — specify serial: just install $VERSION <serial>"
+  fi
+  SERIAL=$(echo "$DEVICE_LIST" | head -1)
+  info "Device: $SERIAL (auto)"
+fi
+
+# ── Verify device is reachable ────────────────
+$ADB shell true 2>/dev/null || fail "Device not reachable: $SERIAL"
+
+# ── Push ──────────────────────────────────────
+REMOTE_PATH="/sdcard/janus_v${VERSION}.apk"
+$ADB shell "rm -f \"${REMOTE_PATH}\"" 2>/dev/null || true
+
+info "Pushing APK to device…"
+$ADB push "$APK_PATH" "$REMOTE_PATH" || fail "adb push failed"
+
+# ── Install ───────────────────────────────────
+info "Installing…"
+INSTALL_OUT=$($ADB shell "CLASSPATH=/system/framework/pm.jar app_process /system/bin \
+  com.android.commands.pm.Pm install -r \"${REMOTE_PATH}\"" 2>&1)
+
+if echo "$INSTALL_OUT" | grep -qiE '(failure|error|not installed|cannot install)'; then
+  warn "Installation reported issues:"
+  echo "$INSTALL_OUT" | sed 's/^/  /'
+fi
+
+# ── Clean up remote APK ──────────────────────
+info "Cleaning up temporary file on device…"
+$ADB shell "rm -f \"${REMOTE_PATH}\" && sync" || warn "Cleanup failed (non-fatal)"
+
+# ── Dalvik-cache wipe ────────────────────────
+info "Clearing dalvik-cache…"
+$ADB shell 'for d in /data/dalvik-cache/arm /data/dalvik-cache/arm64; do
+  if [ -d "$d" ]; then
+    rm -rf "${d:?}"/* && echo "Cleared $d"
+  fi
+done && sync' || warn "Dalvik-cache cleanup failed (non-fatal)"
+
+# ── Check result ─────────────────────────────
+if echo "$INSTALL_OUT" | grep -qiE '(failure|error)'; then
+  fail "Installation failed. See output above."
+fi
+
+info "Installation successful!"
+
+# ── Reboot ────────────────────────────────────
+info "Rebooting device…"
+$ADB reboot
+info "Device is rebooting."
