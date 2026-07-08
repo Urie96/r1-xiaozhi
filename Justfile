@@ -9,7 +9,7 @@ install VERSION:
     ./scripts/install-apk {{ VERSION }} {{ device_serial }}
 
 log:
-    adb -s {{ device_serial }} logcat -v threadtime | grep -E "Phicomm|NLUDispatcher|EchoHandler|Wakeup|NativeANTEngine"
+    adb -s {{ device_serial }} logcat -v threadtime | grep -E "XiaoZhi|XiaoZhiSession|XiaoZhiStreamPlayer|XiaoZhiDataSource|ExoPlayer"
 
 default:
     @echo "用法:"

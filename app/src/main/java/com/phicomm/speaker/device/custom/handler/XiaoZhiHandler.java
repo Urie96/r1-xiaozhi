@@ -9,6 +9,7 @@ import com.unisound.vui.util.ExoConstants;
 import com.unisound.vui.util.LogMgr;
 
 import nluparser.scheme.NLU;
+import nluparser.scheme.SName;
 
 /**
  * XiaoZhi 接入 Handler：
@@ -48,7 +49,19 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
 
     @Override
     public boolean acceptInboundEvent0(NLU evt) throws Exception {
-        return evt != null && evt.getText() != null && !evt.getText().trim().isEmpty();
+        if (evt == null || evt.getText() == null || evt.getText().trim().isEmpty()) {
+            return false;
+        }
+        String s = evt.getService();
+        // 放行原厂 DefaultSettingHandler 处理的意图(系统设置/音量调节/蓝牙开关/空气检测/健康等)
+        // 返回 false = 不消费, 事件继续往后传给下游原厂 handler
+        if (SName.SETTING.equals(s) || SName.SETTING_COMMON.equals(s)
+                || SName.GLOBAL_CMD.equals(s) || SName.HEALTH_INFO.equals(s)
+                || SName.SETTING_AIR.equals(s)) {
+            return false;
+        }
+        // 其余意图(天气/音乐/闲聊/未知等)一律走小智
+        return true;
     }
 
     @Override
