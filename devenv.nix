@@ -62,15 +62,9 @@
 
     # Python 3 explicitly (for build_janus_v2.py)
     python3
+    just
+    jdt-language-server
   ];
-
-  scripts.logcat.exec = ''
-    #!/usr/bin/env bash
-    DEVICE_IP="''${1:-192.168.5.9}"
-    adb connect "$DEVICE_IP:5555"
-    sleep 1
-    adb logcat | grep -E 'Phicomm|NLUDispatcher|DEBUG|Persona|Eavesdrop|Wakeup|VAD|NativeANTEngine'
-  '';
 
   enterShell = ''
     # Override local.properties with nix-provided SDK path

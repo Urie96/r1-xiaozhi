@@ -4,24 +4,16 @@ import android.content.Context;
 
 import com.unisound.vui.util.LogMgr;
 
-import org.json.JSONObject;
-
 import java.io.IOException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.WebSocket;
-import okhttp3.WebSocketListener;
-import okio.ByteString;
 
 public final class XiaoZhiStreamingSession {
     public interface Callback {
         void onPlaybackStarted();
 
         void onPlaybackEnded();
+
+        void onNoAudio();
 
         void onError(String errorMessage);
     }
@@ -31,32 +23,26 @@ public final class XiaoZhiStreamingSession {
     private static final int SERVER_CHANNELS = 1;
 
     private final Context context;
-    private final String wsUrl;
-    private final String agentId;
+    private final XiaoZhiBridgeManager bridgeManager;
     private final Callback callback;
-    private final OkHttpClient client;
     private final AtomicBoolean finished = new AtomicBoolean(false);
     private final AtomicBoolean canceled = new AtomicBoolean(false);
 
+    private XiaoZhiTurn turn;
     private XiaoZhiStreamDataSource dataSource;
     private XiaoZhiStreamPlayer player;
     private OggOpusStreamMuxer muxer;
-    private WebSocket webSocket;
+    private Thread feederThread;
     private int audioFrames;
 
-    public XiaoZhiStreamingSession(Context context, String serverBaseUrl, String agentId, Callback callback) {
+    public XiaoZhiStreamingSession(Context context, XiaoZhiBridgeManager bridgeManager, Callback callback) {
         this.context = context.getApplicationContext();
-        this.wsUrl = toWsUrl(serverBaseUrl);
-        this.agentId = agentId;
+        this.bridgeManager = bridgeManager;
         this.callback = callback;
-        this.client = new OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(0, TimeUnit.SECONDS)
-                .writeTimeout(10, TimeUnit.SECONDS)
-                .build();
     }
 
-    public void start(String text) {
+    public void start(XiaoZhiTurn turn) {
+        this.turn = turn;
         try {
             this.muxer = new OggOpusStreamMuxer();
             this.dataSource = new XiaoZhiStreamDataSource();
@@ -66,7 +52,7 @@ public final class XiaoZhiStreamingSession {
             this.player.start(this.dataSource, new XiaoZhiStreamPlayer.Callback() {
                 @Override
                 public void onStreamReady() {
-                    if (!canceled.get() && callback != null) {
+                    if (!canceled.get() && !finished.get() && callback != null) {
                         callback.onPlaybackStarted();
                     }
                 }
@@ -81,7 +67,7 @@ public final class XiaoZhiStreamingSession {
                     fail("xiaozhi stream play error: " + errorMessage);
                 }
             });
-            connect(text);
+            startFeeder();
         } catch (Exception e) {
             fail("start xiaozhi stream failed: " + e.toString());
         }
@@ -89,9 +75,9 @@ public final class XiaoZhiStreamingSession {
 
     public void cancel() {
         canceled.set(true);
-        if (webSocket != null) {
-            webSocket.cancel();
-            webSocket = null;
+        XiaoZhiTurn currentTurn = turn;
+        if (currentTurn != null) {
+            bridgeManager.cancelTurn(currentTurn.uuid());
         }
         if (dataSource != null) {
             dataSource.cancel();
@@ -100,94 +86,61 @@ public final class XiaoZhiStreamingSession {
             player.stop();
             player = null;
         }
-        client.dispatcher().executorService().shutdown();
-        client.connectionPool().evictAll();
     }
 
-    private void connect(final String text) {
-        Request request = new Request.Builder()
-                .url(wsUrl)
-                .header("Protocol-Version", "1")
-                .header("Client-Id", "feixun-r1")
-                .header("Device-Id", "feixun-r1")
-                .build();
-        this.webSocket = client.newWebSocket(request, new WebSocketListener() {
+    private void startFeeder() {
+        feederThread = new Thread(new Runnable() {
             @Override
-            public void onOpen(WebSocket webSocket, Response response) {
-                try {
-                    JSONObject hello = new JSONObject();
-                    hello.put("type", "hello");
-                    hello.put("transport", "websocket");
-                    hello.put("version", 1);
-                    webSocket.send(hello.toString());
-
-                    JSONObject recognize = new JSONObject();
-                    recognize.put("type", "listen");
-                    recognize.put("state", "recognize");
-                    recognize.put("text", text);
-                    recognize.put("agent_id", agentId);
-                    webSocket.send(recognize.toString());
-                    LogMgr.d(TAG, "recognize sent: " + text);
-                } catch (Exception e) {
-                    fail("send recognize failed: " + e.toString());
-                }
+            public void run() {
+                feedLoop();
             }
-
-            @Override
-            public void onMessage(WebSocket webSocket, String text) {
-                handleControlMessage(webSocket, text);
-            }
-
-            @Override
-            public void onMessage(WebSocket webSocket, ByteString bytes) {
-                handleAudioFrame(bytes);
-            }
-
-            @Override
-            public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                if (!canceled.get() && !finished.get()) {
-                    fail("xiaozhi websocket failed: " + t.toString());
-                }
-            }
-
-            @Override
-            public void onClosed(WebSocket webSocket, int code, String reason) {
-                LogMgr.d(TAG, "websocket closed: " + code + ", " + reason);
-            }
-        });
+        }, "xiaozhi-stream-feeder");
+        feederThread.setDaemon(true);
+        feederThread.start();
     }
 
-    private void handleControlMessage(WebSocket webSocket, String message) {
-        if (canceled.get() || finished.get()) {
+    private void feedLoop() {
+        while (!canceled.get() && !finished.get()) {
+            try {
+                XiaoZhiTurn.Event event = turn.take();
+                if (event.type == XiaoZhiTurn.EVENT_AUDIO) {
+                    handleAudioFrame(event.data);
+                } else if (event.type == XiaoZhiTurn.EVENT_FINISH) {
+                    handleFinish();
+                    return;
+                } else if (event.type == XiaoZhiTurn.EVENT_ERROR) {
+                    fail(event.message == null ? "xiaozhi turn failed" : event.message);
+                    return;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("xiaozhi feeder interrupted");
+                return;
+            }
+        }
+    }
+
+    private void handleFinish() {
+        if (audioFrames <= 0) {
+            finishNoAudio();
             return;
         }
         try {
-            JSONObject json = new JSONObject(message);
-            String type = json.optString("type", "");
-            String state = json.optString("state", "");
-            if ("tts".equals(type) && "stop".equals(state)) {
-                LogMgr.d(TAG, "tts stop, frames=" + audioFrames);
-                if (audioFrames <= 0) {
-                    LogMgr.d(TAG, "ignore empty tts stop before first audio frame");
-                    return;
-                }
-                if (dataSource != null && muxer != null) {
-                    dataSource.feed(muxer.buildEndPage());
-                    dataSource.finish();
-                }
-                webSocket.close(1000, "done");
+            if (dataSource != null && muxer != null) {
+                dataSource.feed(muxer.buildEndPage());
+                dataSource.finish();
             }
-        } catch (Exception e) {
-            fail("parse xiaozhi control failed: " + e.toString());
+        } catch (IOException e) {
+            fail("finish ogg stream failed: " + e.toString());
         }
     }
 
-    private void handleAudioFrame(ByteString bytes) {
+    private void handleAudioFrame(byte[] packet) {
         if (canceled.get() || finished.get() || dataSource == null || muxer == null) {
             return;
         }
         try {
-            byte[] page = muxer.buildAudioPage(bytes.toByteArray());
+            byte[] page = muxer.buildAudioPage(packet);
             if (page != null) {
                 dataSource.feed(page);
                 audioFrames++;
@@ -200,15 +153,12 @@ public final class XiaoZhiStreamingSession {
         }
     }
 
-    private void finishNormally() {
+    private void finishNoAudio() {
         if (!finished.compareAndSet(false, true)) {
             return;
         }
-        LogMgr.d(TAG, "playback ended");
-        if (webSocket != null) {
-            webSocket.close(1000, "playback-ended");
-            webSocket = null;
-        }
+        LogMgr.d(TAG, "turn finished without tts audio");
+        completeTurn();
         if (dataSource != null) {
             dataSource.cancel();
             dataSource = null;
@@ -217,8 +167,25 @@ public final class XiaoZhiStreamingSession {
             player.stop();
             player = null;
         }
-        client.dispatcher().executorService().shutdown();
-        client.connectionPool().evictAll();
+        if (!canceled.get() && callback != null) {
+            callback.onNoAudio();
+        }
+    }
+
+    private void finishNormally() {
+        if (!finished.compareAndSet(false, true)) {
+            return;
+        }
+        LogMgr.d(TAG, "playback ended");
+        completeTurn();
+        if (dataSource != null) {
+            dataSource.cancel();
+            dataSource = null;
+        }
+        if (player != null) {
+            player.stop();
+            player = null;
+        }
         if (!canceled.get() && callback != null) {
             callback.onPlaybackEnded();
         }
@@ -229,10 +196,7 @@ public final class XiaoZhiStreamingSession {
         if (!finished.compareAndSet(false, true)) {
             return;
         }
-        if (webSocket != null) {
-            webSocket.cancel();
-            webSocket = null;
-        }
+        completeTurn();
         if (dataSource != null) {
             dataSource.cancel();
             dataSource = null;
@@ -241,27 +205,15 @@ public final class XiaoZhiStreamingSession {
             player.stop();
             player = null;
         }
-        client.dispatcher().executorService().shutdown();
-        client.connectionPool().evictAll();
         if (!canceled.get() && callback != null) {
             callback.onError(message);
         }
     }
 
-    private static String toWsUrl(String serverBaseUrl) {
-        String base = serverBaseUrl == null ? "" : serverBaseUrl.trim();
-        if (base.endsWith("/")) {
-            base = base.substring(0, base.length() - 1);
+    private void completeTurn() {
+        XiaoZhiTurn currentTurn = turn;
+        if (currentTurn != null) {
+            bridgeManager.completeTurn(currentTurn.uuid());
         }
-        if (base.startsWith("https://")) {
-            return "wss://" + base.substring("https://".length()) + "/ws";
-        }
-        if (base.startsWith("http://")) {
-            return "ws://" + base.substring("http://".length()) + "/ws";
-        }
-        if (base.startsWith("ws://") || base.startsWith("wss://")) {
-            return base.endsWith("/ws") ? base : base + "/ws";
-        }
-        return "ws://" + base + "/ws";
     }
 }

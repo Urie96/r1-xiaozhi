@@ -1,6 +1,8 @@
 package com.phicomm.speaker.device.custom.handler;
 
+import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiBridgeManager;
 import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiStreamingSession;
+import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiTurn;
 import com.unisound.vui.engine.ANTEngineOption;
 import com.unisound.vui.engine.ANTHandlerContext;
 import com.unisound.vui.handler.SessionRegister;
@@ -12,20 +14,20 @@ import nluparser.scheme.NLU;
 import nluparser.scheme.SName;
 
 /**
- * XiaoZhi 接入 Handler：
+ * XiaoZhi 本机桥接 Handler：
  *
- *   唤醒 → R1 原厂 ASR → XiaoZhiHandler 拦截 ASR 文本
- *        → xiaozhi-server-rs websocket recognize(agent_id=zhuzhu)
- *        → 服务端 Opus binary frame 实时封装 Ogg page
- *        → ExoPlayer 通过阻塞 DataSource 边收边播
- *        → 播完直接 enterASR 连续对话
+ *   唤醒 → R1 native ASR 音频 POST 到 127.0.0.1:8089
+ *        → APK 内本地 HTTP 服务转发 Opus 到 xiaozhi-server-rs WebSocket
+ *        → 本地 HTTP 服务返回携带 UUID 的假 NLU
+ *        → XiaoZhiHandler 用 UUID 取得本轮 TTS 队列
+ *        → ExoPlayer 通过自定义 DataSource 边收边播 Ogg Opus
+ *        → 有 TTS 音频则播完 enterASR 连续对话；无音频则退回未唤醒
  */
 public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String TAG = "XiaoZhiHandler";
-    private static final String SERVER_BASE_URL = "http://home.lubui.com:3116";
-    private static final String AGENT_ID = "zhuzhu";
 
     private ANTHandlerContext ctx;
+    private XiaoZhiBridgeManager bridgeManager;
     private XiaoZhiStreamingSession session;
     private volatile boolean interrupted;
     private volatile boolean active;
@@ -37,30 +39,88 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
 
     @Override
     public void initPriority() {
-        // 抢在所有原厂业务 Handler 前，避免天气/音乐/闲聊等下游消费。
         setPriority(1000);
     }
 
     @Override
     public boolean onASREventEngineInitDone(ANTHandlerContext ctx) {
         this.ctx = ctx;
+        this.bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
+        this.bridgeManager.startLocalHttpServer();
+        com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil = 400;
+        setNativeTRUrl(XiaoZhiBridgeManager.localTrAddr());
         return super.onASREventEngineInitDone(ctx);
+    }
+
+    private static String sessionIdFrom(NLU evt) {
+        if (evt == null) {
+            return null;
+        }
+        String text = evt.getText();
+        if (text != null && !(text = text.trim()).isEmpty()) {
+            return text;
+        }
+        String responseId = evt.getResponseId();
+        if (responseId != null && !(responseId = responseId.trim()).isEmpty()) {
+            return responseId;
+        }
+        return null;
+    }
+
+    private static boolean isValidSessionId(String sessionId) {
+        if (sessionId == null || sessionId.length() < 8 || sessionId.length() > 128) {
+            return false;
+        }
+        for (int i = 0; i < sessionId.length(); i++) {
+            char c = sessionId.charAt(i);
+            if (!((c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || c == '-' || c == '_' || c == '.')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void setNativeTRUrl(String addr) {
+        try {
+            com.unisound.vui.common.config.ANTConfigPreference.sVersionType = "develop";
+            java.lang.reflect.Field f = com.unisound.vui.common.config.ANTConfigPreference.class
+                    .getDeclaredField("sDevTRServer");
+            f.setAccessible(true);
+            f.set(null, addr);
+            LogMgr.d(TAG, "ANTConfigPreference TR URL set to " + addr);
+        } catch (Exception e) {
+            LogMgr.e(TAG, "failed to set ANTConfigPreference TR URL: " + e.getMessage());
+        }
+
+        try {
+            java.lang.reflect.Field cField = com.unisound.vui.engine.NativeANTEngine.class
+                    .getDeclaredField("c");
+            cField.setAccessible(true);
+            String oldUrl = (String) cField.get(null);
+            cField.set(null, addr);
+            LogMgr.d(TAG, "NativeANTEngine.c updated: " + oldUrl + " → " + addr);
+        } catch (Exception e) {
+            LogMgr.e(TAG, "failed to set NativeANTEngine.c: " + e.getMessage());
+        }
     }
 
     @Override
     public boolean acceptInboundEvent0(NLU evt) throws Exception {
-        if (evt == null || evt.getText() == null || evt.getText().trim().isEmpty()) {
+        if (evt == null) {
             return false;
         }
-        String s = evt.getService();
-        // 放行原厂 DefaultSettingHandler 处理的意图(系统设置/音量调节/蓝牙开关/空气检测/健康等)
-        // 返回 false = 不消费, 事件继续往后传给下游原厂 handler
-        if (SName.SETTING.equals(s) || SName.SETTING_COMMON.equals(s)
-                || SName.GLOBAL_CMD.equals(s) || SName.HEALTH_INFO.equals(s)
-                || SName.SETTING_AIR.equals(s)) {
+        if (SName.ERROR_REPORT.equals(evt.getService())) {
+            LogMgr.e(TAG, "ignore ASR error nlu, code=" + evt.getCode() + ", text=" + evt.getText());
             return false;
         }
-        // 其余意图(天气/音乐/闲聊/未知等)一律走小智
+        String sessionId = sessionIdFrom(evt);
+        if (!isValidSessionId(sessionId)) {
+            LogMgr.e(TAG, "ignore invalid xiaozhi session id: " + sessionId + ", service=" + evt.getService());
+            return false;
+        }
         return true;
     }
 
@@ -72,18 +132,28 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         this.active = true;
         this.playingRemoteAudio = false;
 
-        final String text = evt.getText().trim();
-        LogMgr.d(TAG, "recognize text: \"" + text + "\"");
+        final String uuid = sessionIdFrom(evt);
+        LogMgr.d(TAG, "session uuid: " + uuid);
 
         cancelCurrentSession();
         ctx.stopWakeup();
         ctx.stopASR();
         ctx.engine().config().setOption(ANTEngineOption.ASR_VAD_TIMEOUT_BACKSIL, 400);
 
+        if (bridgeManager == null) {
+            bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
+            bridgeManager.startLocalHttpServer();
+        }
+        XiaoZhiTurn turn = bridgeManager.takeTurn(uuid);
+        if (turn == null) {
+            LogMgr.e(TAG, "missing xiaozhi turn: " + uuid);
+            ctx.playTTS("小智服务暂时不可用，请稍后再试");
+            return;
+        }
+
         XiaoZhiStreamingSession next = new XiaoZhiStreamingSession(
                 ctx.androidContext(),
-                SERVER_BASE_URL,
-                AGENT_ID,
+                bridgeManager,
                 new XiaoZhiStreamingSession.Callback() {
                     @Override
                     public void onPlaybackStarted() {
@@ -103,6 +173,17 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                     }
 
                     @Override
+                    public void onNoAudio() {
+                        LogMgr.d(TAG, "xiaozhi no tts audio, enter wakeup");
+                        playingRemoteAudio = false;
+                        session = null;
+                        if (!interrupted && XiaoZhiHandler.this.ctx != null) {
+                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                        }
+                        reset();
+                    }
+
+                    @Override
                     public void onError(String errorMessage) {
                         LogMgr.e(TAG, errorMessage);
                         playingRemoteAudio = false;
@@ -114,7 +195,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                 }
         );
         this.session = next;
-        next.start(text);
+        next.start(turn);
     }
 
     @Override
@@ -122,7 +203,6 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         if (!this.eventReceived) {
             return super.onTTSEventPlayingEnd(ctx);
         }
-        // 只有错误兜底 TTS 会走这里；正常小智音频由流式播放器 callback 收尾。
         LogMgr.d(TAG, "fallback tts end, enter ASR");
         ctx.enterASR();
         reset();
