@@ -46,6 +46,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     public boolean onASREventEngineInitDone(ANTHandlerContext ctx) {
         this.ctx = ctx;
         this.bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
+        this.bridgeManager.registerAntContext(ctx);
         this.bridgeManager.startLocalHttpServer();
         com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil = 400;
         setNativeTRUrl(XiaoZhiBridgeManager.localTrAddr());

@@ -6,6 +6,9 @@ import android.content.Context;
 import com.phicomm.speaker.device.custom.ipc.PhicommXController;
 import com.phicomm.speaker.device.custom.status.PhicommDeviceStatusProcessor;
 import com.unisound.ant.device.controlor.DefaultVolumeOperator;
+import com.unisound.vui.engine.ANTEngine;
+import com.unisound.vui.engine.ANTHandlerContext;
+import com.unisound.vui.util.ExoConstants;
 import com.unisound.vui.util.LogMgr;
 
 import org.json.JSONObject;
@@ -32,6 +35,7 @@ public final class XiaoZhiBridgeManager {
     private final XiaoZhiUpstreamClient upstream;
     private final PhicommXController phicommXController;
     private final Map<String, ActiveSession> active = new HashMap<String, ActiveSession>();
+    private volatile ANTHandlerContext antContext;
     private volatile boolean serverStarted;
 
     private XiaoZhiBridgeManager(Context context) {
@@ -49,6 +53,10 @@ public final class XiaoZhiBridgeManager {
 
     public static String localTrAddr() {
         return LOCAL_TR_ADDR;
+    }
+
+    public void registerAntContext(ANTHandlerContext ctx) {
+        this.antContext = ctx;
     }
 
     public void startLocalHttpServer() {
@@ -115,10 +123,12 @@ public final class XiaoZhiBridgeManager {
                 response = handleTraffic(request);
             } else if ("GET".equals(request.method) && "/health".equals(path)) {
                 response = new Response(200, null, null, null, null, "{\"status\":\"ok\"}".getBytes("UTF-8"));
-            } else if (isApiMethod(request.method) && isBluetoothPath(path)) {
+            } else if (isBluetoothRoute(request.method, path)) {
                 response = handleBluetooth(path);
-            } else if (isApiMethod(request.method) && isVolumePath(path)) {
+            } else if (isVolumeRoute(request.method, path)) {
                 response = handleVolume(request);
+            } else if (isAsrRoute(request.method, path)) {
+                response = handleAsr(path);
             } else {
                 response = new Response(404, null, null, null, null, new byte[0]);
             }
@@ -170,19 +180,16 @@ public final class XiaoZhiBridgeManager {
     }
 
     private Response handleBluetooth(String path) throws Exception {
-        if (isPath(path, "/api/bluetooth") || isPath(path, "/api/bluetooth/status")
-                || isPath(path, "/bluetooth") || isPath(path, "/bluetooth/status")) {
+        if (isPath(path, "/api/bluetooth")) {
             return bluetoothStatusResponse("status", null, true, null);
         }
 
         boolean enable;
         String action;
-        if (isPath(path, "/api/bluetooth/on") || isPath(path, "/api/bluetooth/open") || isPath(path, "/api/bluetooth/enable")
-                || isPath(path, "/bluetooth/on") || isPath(path, "/bluetooth/open") || isPath(path, "/bluetooth/enable")) {
+        if (isPath(path, "/api/bluetooth/on")) {
             enable = true;
             action = "on";
-        } else if (isPath(path, "/api/bluetooth/off") || isPath(path, "/api/bluetooth/close") || isPath(path, "/api/bluetooth/disable")
-                || isPath(path, "/bluetooth/off") || isPath(path, "/bluetooth/close") || isPath(path, "/bluetooth/disable")) {
+        } else if (isPath(path, "/api/bluetooth/off")) {
             enable = false;
             action = "off";
         } else {
@@ -245,39 +252,83 @@ public final class XiaoZhiBridgeManager {
         }
     }
 
+    private Response handleAsr(String path) throws Exception {
+        if (isPath(path, "/api/asr")) {
+            return asrStatusResponse("status", true, null, 200);
+        }
+
+        if (isPath(path, "/api/asr/wakeup")) {
+            ANTHandlerContext ctx = this.antContext;
+            if (ctx == null) {
+                return asrStatusResponse("wakeupAsr", false, "ant context not ready", 503);
+            }
+            try {
+                ctx.pipeline().fireUserEventTriggered(ExoConstants.DO_ENTER_ASR_BY_MIC);
+                LogMgr.d(TAG, "asr api wakeupAsr requested");
+                return asrStatusResponse("wakeupAsr", true, null, 200);
+            } catch (Throwable t) {
+                String error = t.toString();
+                LogMgr.e(TAG, "asr api wakeupAsr failed: " + error);
+                return asrStatusResponse("wakeupAsr", false, error, 500);
+            }
+        }
+
+        return new Response(404, null, null, null, null, new byte[0]);
+    }
+
+    private Response asrStatusResponse(String action, boolean ok, String error, int status) throws Exception {
+        ANTHandlerContext ctx = this.antContext;
+        JSONObject json = new JSONObject();
+        json.put("ok", ok);
+        json.put("action", action);
+        json.put("contextReady", ctx != null);
+        if (ctx != null) {
+            try {
+                ANTEngine engine = ctx.engine();
+                json.put("engineState", engine.getEngineState());
+                json.put("wakeup", engine.isWakeup());
+                json.put("asr", engine.isASR());
+                json.put("recognition", engine.isRecognition());
+                json.put("ttsPlaying", engine.isTTSPlaying());
+            } catch (Throwable t) {
+                json.put("stateError", t.toString());
+            }
+        }
+        if (error != null) {
+            json.put("error", error);
+        }
+        return new Response(status, null, null, null, null, json.toString().getBytes("UTF-8"));
+    }
+
     private Response handleVolume(Request request) throws Exception {
         String path = pathOnly(request.path);
         DefaultVolumeOperator volumeOperator = DefaultVolumeOperator.getInstance(this.context);
-        if (isPath(path, "/api/volume") || isPath(path, "/api/volume/status")
-                || isPath(path, "/volume") || isPath(path, "/volume/status")) {
+        if (isPath(path, "/api/volume")) {
             return volumeResponse("status", null, null, true, null, 200);
         }
 
-        if (isPath(path, "/api/volume/up") || isPath(path, "/volume/up")) {
+        if (isPath(path, "/api/volume/up")) {
             volumeOperator.setVolumeRaise();
             return volumeResponse("up", null, null, true, null, 200);
         }
-        if (isPath(path, "/api/volume/down") || isPath(path, "/volume/down")) {
+        if (isPath(path, "/api/volume/down")) {
             volumeOperator.setVolumeLower();
             return volumeResponse("down", null, null, true, null, 200);
         }
-        if (isPath(path, "/api/volume/max") || isPath(path, "/volume/max")) {
+        if (isPath(path, "/api/volume/max")) {
             volumeOperator.setVolumeMax();
             return volumeResponse("max", Integer.valueOf(volumeOperator.getMaxVolume()), Integer.valueOf(100), true, null, 200);
         }
-        if (isPath(path, "/api/volume/min") || isPath(path, "/volume/min")) {
+        if (isPath(path, "/api/volume/min")) {
             volumeOperator.setVolumeMin();
             return volumeResponse("min", Integer.valueOf(1), null, true, null, 200);
         }
-        if (!isPath(path, "/api/volume/set") && !isPath(path, "/volume/set")) {
+        if (!isPath(path, "/api/volume/set")) {
             return new Response(404, null, null, null, null, new byte[0]);
         }
 
         String levelText = queryParam(request.path, "level");
         String percentText = queryParam(request.path, "percent");
-        if (percentText == null) {
-            percentText = queryParam(request.path, "value");
-        }
         if (request.body.length > 0 && levelText == null && percentText == null) {
             try {
                 JSONObject body = new JSONObject(new String(request.body, "UTF-8"));
@@ -285,8 +336,6 @@ public final class XiaoZhiBridgeManager {
                     levelText = body.optString("level", null);
                 } else if (body.has("percent")) {
                     percentText = body.optString("percent", null);
-                } else if (body.has("value")) {
-                    percentText = body.optString("value", null);
                 }
             } catch (Exception e) {
                 return volumeResponse("set", null, null, false, "invalid json body", 400);
@@ -319,7 +368,7 @@ public final class XiaoZhiBridgeManager {
             return volumeResponse("set", null, null, false, "invalid volume number", 400);
         }
         return volumeResponse("set", null, null, false,
-                "missing percent/value or level parameter", 400);
+                "missing percent or level parameter", 400);
     }
 
     private Response volumeResponse(String action, Integer requestedLevel, Integer requestedPercent,
@@ -364,18 +413,20 @@ public final class XiaoZhiBridgeManager {
         return null;
     }
 
-    private static boolean isApiMethod(String method) {
-        return "GET".equals(method) || "POST".equals(method);
+    private static boolean isBluetoothRoute(String method, String path) {
+        return ("GET".equals(method) && path.equals("/api/bluetooth"))
+                || ("POST".equals(method) && (path.equals("/api/bluetooth/on") || path.equals("/api/bluetooth/off")));
     }
 
-    private static boolean isBluetoothPath(String path) {
-        return path != null && (path.equals("/api/bluetooth") || path.equals("/bluetooth")
-                || path.startsWith("/api/bluetooth/") || path.startsWith("/bluetooth/"));
+    private static boolean isVolumeRoute(String method, String path) {
+        return ("GET".equals(method) && path.equals("/api/volume"))
+                || ("POST".equals(method) && (path.equals("/api/volume/up") || path.equals("/api/volume/down")
+                || path.equals("/api/volume/max") || path.equals("/api/volume/min") || path.equals("/api/volume/set")));
     }
 
-    private static boolean isVolumePath(String path) {
-        return path != null && (path.equals("/api/volume") || path.equals("/volume")
-                || path.startsWith("/api/volume/") || path.startsWith("/volume/"));
+    private static boolean isAsrRoute(String method, String path) {
+        return ("GET".equals(method) && path.equals("/api/asr"))
+                || ("POST".equals(method) && path.equals("/api/asr/wakeup"));
     }
 
     private static boolean isPath(String path, String expect) {
