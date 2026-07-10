@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────
-# install-apk — 安装指定版本的 Janus APK 到设备
-# Usage: install-apk <version_number> [device_serial]
-# Example: install-apk 5                     → 默认 serial
-#          install-apk 5 192.168.5.9:5555     → TCP 设备
-#          install-apk 5 1234567890abcdef     → USB 设备
+# install-apk — 安装 Janus APK 到设备
+# Usage: install-apk [device_serial]
+# Example: install-apk                     → 默认 serial
+#          install-apk 192.168.5.9:5555     → TCP 设备
+#          install-apk 1234567890abcdef     → USB 设备
 # ──────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -23,14 +23,12 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
 # ── Arguments ─────────────────────────────────
-[[ $# -lt 1 ]] && fail "Usage: $0 <version_number> [device_serial]"
-VERSION="$1"
-SERIAL="${2:-}"
-
-# ── Resolve APK path ─────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-APK_PATH="$PROJECT_DIR/dist/janus_unisound_v${VERSION}.apk"
+SERIAL="${1:-}"
+
+# ── Resolve APK path ─────────────────────────
+APK_PATH="$PROJECT_DIR/dist/janus_unisound.apk"
 
 [[ -f "$APK_PATH" ]] || fail "APK not found: $APK_PATH"
 [[ -s "$APK_PATH" ]] || fail "APK is empty: $APK_PATH"
@@ -54,9 +52,9 @@ else
   DEVICE_LIST=$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}')
   DEVICE_COUNT=$(echo "$DEVICE_LIST" | grep -c . || true)
   if [ "$DEVICE_COUNT" -eq 0 ]; then
-    fail "No device connected. Try: just install $VERSION 192.168.5.9:5555"
+    fail "No device connected. Try: just install 192.168.5.9:5555"
   elif [ "$DEVICE_COUNT" -gt 1 ]; then
-    fail "Multiple devices found — specify serial: just install $VERSION <serial>"
+    fail "Multiple devices found — specify serial: just install <serial>"
   fi
   SERIAL=$(echo "$DEVICE_LIST" | head -1)
   info "Device: $SERIAL (auto)"
@@ -66,7 +64,7 @@ fi
 $ADB shell true 2>/dev/null || fail "Device not reachable: $SERIAL"
 
 # ── Push ──────────────────────────────────────
-REMOTE_PATH="/sdcard/janus_v${VERSION}.apk"
+REMOTE_PATH="/sdcard/janus.apk"
 $ADB shell "rm -f \"${REMOTE_PATH}\"" 2>/dev/null || true
 
 info "Pushing APK to device…"

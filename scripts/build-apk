@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
 # One-step APK build.
-# Usage: build-apk <version_number>
-# Example: build-apk 62
+# Usage: build-apk
+# Builds dist/janus_unisound.apk (versionless, overwrites on each run).
 
 set -e
-
-VERSION="${1:-}"
-if [ -z "$VERSION" ]; then
-  echo "Usage: build-apk <version_number>"
-  echo "Example: build-apk 62"
-  exit 1
-fi
 
 # 确定项目根目录（从脚本自身位置推导，不依赖 DEVENV_ROOT）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -48,7 +41,7 @@ mkdir -p "$DIST_DIR"
 # 注意：smali-base/ 在项目根目录（不是 build/ 下），不会被 gradle clean 删除
 if [ ! -d "$SMALI_BASE" ]; then
   echo "=== [0a] Generating smali-base from device_original.apk ==="
-  EXTRACT_DIR="/tmp/v${VERSION}_base_extract"
+  EXTRACT_DIR="/tmp/janus_build_base_extract"
   mkdir -p "$EXTRACT_DIR"
   unzip -o "$ORIGINAL_APK" classes.dex -d "$EXTRACT_DIR"
   java -jar "$TOOLS_DIR/baksmali.jar" d "$EXTRACT_DIR/classes.dex" -o "$SMALI_BASE"
@@ -59,41 +52,41 @@ fi
 
 
 echo "=== [1/7] Compiling Java sources ==="
+# Gradle compiles both source roots configured in app/build.gradle:
+#   java/          = our added/overridden code
+#   java-original/ = factory dependency code
+# java-jadx-reference/ is documentation only and is never compiled.
 ./gradlew clean :app:assembleRelease
 
-echo "=== [2/7] Extracting .class files ==="
-CLASSES_DIR="/tmp/v${VERSION}_classes"
+echo "=== [2/7] Extracting modified .class files ==="
+CLASSES_DIR="/tmp/janus_build_classes"
 rm -rf "$CLASSES_DIR"
 mkdir -p "$CLASSES_DIR/com/phicomm/speaker/device"
 mkdir -p "$CLASSES_DIR/com/phicomm/speaker/device/ui"
-mkdir -p "$CLASSES_DIR/com/unisound/vui/handler/filter"
-mkdir -p "$CLASSES_DIR/com/unisound/ant/device/mqtt"
 
+# Only these two injection groups enter the factory smali base. Their source
+# location is irrelevant here because Gradle merges the two compiling roots.
 cp -r app/build/intermediates/javac/release/classes/com/phicomm/speaker/device/custom \
   "$CLASSES_DIR/com/phicomm/speaker/device/" 2>/dev/null || true
 cp app/build/intermediates/javac/release/classes/com/phicomm/speaker/device/ui/ExampleANTEngineInitializer*.class \
   "$CLASSES_DIR/com/phicomm/speaker/device/ui/" 2>/dev/null || true
-cp app/build/intermediates/javac/release/classes/com/unisound/vui/handler/filter/NLUDispatcher*.class \
-  "$CLASSES_DIR/com/unisound/vui/handler/filter/" 2>/dev/null || true
-cp app/build/intermediates/javac/release/classes/com/unisound/ant/device/mqtt/MqttTransportChannel*.class \
-  "$CLASSES_DIR/com/unisound/ant/device/mqtt/" 2>/dev/null || true
 
 CLASS_COUNT=$(find "$CLASSES_DIR" -name "*.class" | wc -l | tr -d ' ')
 echo "  Extracted $CLASS_COUNT class files"
 
 echo "=== [3/7] Compiling DEX ==="
-DEX_DIR="/tmp/v${VERSION}_dex"
+DEX_DIR="/tmp/janus_build_dex"
 rm -rf "$DEX_DIR"
 mkdir -p "$DEX_DIR"
 "$DX" --dex --output="$DEX_DIR/classes.dex" "$CLASSES_DIR"
 
 echo "=== [4/7] DEX → smali ==="
-SMALI_DIR="/tmp/v${VERSION}_smali"
+SMALI_DIR="/tmp/janus_build_smali"
 rm -rf "$SMALI_DIR"
 java -jar "$TOOLS_DIR/baksmali.jar" d "$DEX_DIR/classes.dex" -o "$SMALI_DIR"
 
 echo "=== [5/7] Injecting smali into base ==="
-WORK_SMALI="/tmp/v${VERSION}_work_smali"
+WORK_SMALI="/tmp/janus_build_work_smali"
 rm -rf "$WORK_SMALI"
 cp -r "$SMALI_BASE" "$WORK_SMALI"
 
@@ -104,34 +97,25 @@ if [ -d "$SMALI_DIR/com/phicomm/speaker/device/custom" ]; then
     "$WORK_SMALI/com/phicomm/speaker/device/"
 fi
 
-# 同名覆盖 3 组关键类
+# 同名覆盖入口类
 if [ -f "$SMALI_DIR/com/phicomm/speaker/device/ui/ExampleANTEngineInitializer.smali" ]; then
   cp "$SMALI_DIR/com/phicomm/speaker/device/ui/ExampleANTEngineInitializer.smali" \
     "$WORK_SMALI/com/phicomm/speaker/device/ui/"
 fi
 
-cp "$SMALI_DIR/com/unisound/vui/handler/filter/NLUDispatcher"*.smali \
-  "$WORK_SMALI/com/unisound/vui/handler/filter/" 2>/dev/null || true
-
-cp "$SMALI_DIR/com/unisound/ant/device/mqtt/MqttTransportChannel"*.smali \
-  "$WORK_SMALI/com/unisound/ant/device/mqtt/" 2>/dev/null || true
-
 INJECTED_COUNT=$(find "$WORK_SMALI/com/phicomm/speaker/device/custom" -name "*.smali" 2>/dev/null | wc -l | tr -d ' ')
 echo "  Injected $INJECTED_COUNT custom smali files"
 
 echo "=== [6/7] smali → final DEX ==="
-DEX_OUTPUT="$DIST_DIR/classes_new_v${VERSION}.dex"
+DEX_OUTPUT="$DIST_DIR/classes_new.dex"
 java -jar "$TOOLS_DIR/smali.jar" a -o "$DEX_OUTPUT" "$WORK_SMALI"
 
 echo "=== [7/7] Building Janus APK ==="
-APK_OUTPUT="$DIST_DIR/janus_unisound_v${VERSION}.apk"
+APK_OUTPUT="$DIST_DIR/janus_unisound.apk"
 python3 "$JANUS_SCRIPT" \
   "$ORIGINAL_APK" \
   "$DEX_OUTPUT" \
   "$APK_OUTPUT"
-
-# 最新版本的 symlink 方便引用
-ln -sf "janus_unisound_v${VERSION}.apk" "$DIST_DIR/janus_unisound_latest.apk"
 
 echo ""
 echo "✅ APK built: $APK_OUTPUT"
