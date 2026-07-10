@@ -1,7 +1,11 @@
 package com.phicomm.speaker.device.custom.xiaozhi;
 
+import android.bluetooth.BluetoothAdapter;
 import android.content.Context;
 
+import com.phicomm.speaker.device.custom.ipc.PhicommXController;
+import com.phicomm.speaker.device.custom.status.PhicommDeviceStatusProcessor;
+import com.unisound.ant.device.controlor.DefaultVolumeOperator;
 import com.unisound.vui.util.LogMgr;
 
 import org.json.JSONObject;
@@ -24,12 +28,16 @@ public final class XiaoZhiBridgeManager {
     private static final int MAX_BODY_BYTES = 2 * 1024 * 1024;
     private static XiaoZhiBridgeManager instance;
 
+    private final Context context;
     private final XiaoZhiUpstreamClient upstream;
+    private final PhicommXController phicommXController;
     private final Map<String, ActiveSession> active = new HashMap<String, ActiveSession>();
     private volatile boolean serverStarted;
 
     private XiaoZhiBridgeManager(Context context) {
+        this.context = context;
         this.upstream = new XiaoZhiUpstreamClient(config("xiaozhi_ws", "ws://home.lubui.com:3116/ws"), config("xiaozhi_token", "dev-token"));
+        this.phicommXController = new PhicommXController(context);
     }
 
     public static synchronized XiaoZhiBridgeManager get(Context context) {
@@ -100,10 +108,17 @@ public final class XiaoZhiBridgeManager {
                 return;
             }
             Response response;
-            if ("POST".equals(request.method) && "/trafficRouter/cs".equals(request.path)) {
+            String path = pathOnly(request.path);
+            if ("OPTIONS".equals(request.method)) {
+                response = new Response(204, null, null, null, null, new byte[0]);
+            } else if ("POST".equals(request.method) && "/trafficRouter/cs".equals(path)) {
                 response = handleTraffic(request);
-            } else if ("GET".equals(request.method) && "/health".equals(request.path)) {
+            } else if ("GET".equals(request.method) && "/health".equals(path)) {
                 response = new Response(200, null, null, null, null, "{\"status\":\"ok\"}".getBytes("UTF-8"));
+            } else if (isApiMethod(request.method) && isBluetoothPath(path)) {
+                response = handleBluetooth(path);
+            } else if (isApiMethod(request.method) && isVolumePath(path)) {
+                response = handleVolume(request);
             } else {
                 response = new Response(404, null, null, null, null, new byte[0]);
             }
@@ -152,6 +167,230 @@ public final class XiaoZhiBridgeManager {
         int frames = forwardR1Frames(session.turn.uuid(), request.body);
         session.frames += frames;
         return trafficResponse(sid, "r", "W510-8N4", "GeLdJ", new byte[0]);
+    }
+
+    private Response handleBluetooth(String path) throws Exception {
+        if (isPath(path, "/api/bluetooth") || isPath(path, "/api/bluetooth/status")
+                || isPath(path, "/bluetooth") || isPath(path, "/bluetooth/status")) {
+            return bluetoothStatusResponse("status", null, true, null);
+        }
+
+        boolean enable;
+        String action;
+        if (isPath(path, "/api/bluetooth/on") || isPath(path, "/api/bluetooth/open") || isPath(path, "/api/bluetooth/enable")
+                || isPath(path, "/bluetooth/on") || isPath(path, "/bluetooth/open") || isPath(path, "/bluetooth/enable")) {
+            enable = true;
+            action = "on";
+        } else if (isPath(path, "/api/bluetooth/off") || isPath(path, "/api/bluetooth/close") || isPath(path, "/api/bluetooth/disable")
+                || isPath(path, "/bluetooth/off") || isPath(path, "/bluetooth/close") || isPath(path, "/bluetooth/disable")) {
+            enable = false;
+            action = "off";
+        } else {
+            return new Response(404, null, null, null, null, new byte[0]);
+        }
+
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) {
+            return bluetoothStatusResponse(action, Boolean.valueOf(enable), false, "bluetooth adapter not found");
+        }
+
+        boolean ok = true;
+        String error = null;
+        try {
+            if (enable) {
+                if (!adapter.isEnabled()) {
+                    ok = adapter.enable();
+                }
+                // 走原厂“三击按键”链路，确保同时切换 R1 蓝牙模式/ASR 状态/提示音。
+                this.phicommXController.triggeredTropleClickEvent();
+            } else {
+                // 关闭原厂蓝牙模式；不强制 disable 适配器，避免破坏原厂状态机。
+                this.phicommXController.closeBlueToothStatus();
+            }
+            LogMgr.d(TAG, "bluetooth api action=" + action + ", mode=" + enable + ", ok=" + ok + ", adapterState=" + adapter.getState());
+        } catch (Throwable t) {
+            ok = false;
+            error = t.toString();
+            LogMgr.e(TAG, "bluetooth api failed action=" + action + ": " + error);
+        }
+        return bluetoothStatusResponse(action, Boolean.valueOf(enable), ok, error);
+    }
+
+    private Response bluetoothStatusResponse(String action, Boolean requestedBluetoothMode, boolean ok, String error) throws Exception {
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        JSONObject json = new JSONObject();
+        json.put("ok", ok);
+        json.put("action", action);
+        json.put("supported", adapter != null);
+        if (requestedBluetoothMode != null) {
+            json.put("requestedBluetoothMode", requestedBluetoothMode.booleanValue());
+        }
+        if (adapter != null) {
+            json.put("adapterEnabled", adapter.isEnabled());
+            json.put("adapterState", adapter.getState());
+        }
+        json.put("bluetoothMode", isBluetoothMode());
+        if (error != null) {
+            json.put("error", error);
+        }
+        return new Response(ok ? 200 : 500, null, null, null, null, json.toString().getBytes("UTF-8"));
+    }
+
+    private boolean isBluetoothMode() {
+        try {
+            return PhicommDeviceStatusProcessor.getInstance().getDeviceStatus() == PhicommDeviceStatusProcessor.STATUS_BLUETOOTH;
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "get bluetooth mode failed: " + t.toString());
+            return false;
+        }
+    }
+
+    private Response handleVolume(Request request) throws Exception {
+        String path = pathOnly(request.path);
+        DefaultVolumeOperator volumeOperator = DefaultVolumeOperator.getInstance(this.context);
+        if (isPath(path, "/api/volume") || isPath(path, "/api/volume/status")
+                || isPath(path, "/volume") || isPath(path, "/volume/status")) {
+            return volumeResponse("status", null, null, true, null, 200);
+        }
+
+        if (isPath(path, "/api/volume/up") || isPath(path, "/volume/up")) {
+            volumeOperator.setVolumeRaise();
+            return volumeResponse("up", null, null, true, null, 200);
+        }
+        if (isPath(path, "/api/volume/down") || isPath(path, "/volume/down")) {
+            volumeOperator.setVolumeLower();
+            return volumeResponse("down", null, null, true, null, 200);
+        }
+        if (isPath(path, "/api/volume/max") || isPath(path, "/volume/max")) {
+            volumeOperator.setVolumeMax();
+            return volumeResponse("max", Integer.valueOf(volumeOperator.getMaxVolume()), Integer.valueOf(100), true, null, 200);
+        }
+        if (isPath(path, "/api/volume/min") || isPath(path, "/volume/min")) {
+            volumeOperator.setVolumeMin();
+            return volumeResponse("min", Integer.valueOf(1), null, true, null, 200);
+        }
+        if (!isPath(path, "/api/volume/set") && !isPath(path, "/volume/set")) {
+            return new Response(404, null, null, null, null, new byte[0]);
+        }
+
+        String levelText = queryParam(request.path, "level");
+        String percentText = queryParam(request.path, "percent");
+        if (percentText == null) {
+            percentText = queryParam(request.path, "value");
+        }
+        if (request.body.length > 0 && levelText == null && percentText == null) {
+            try {
+                JSONObject body = new JSONObject(new String(request.body, "UTF-8"));
+                if (body.has("level")) {
+                    levelText = body.optString("level", null);
+                } else if (body.has("percent")) {
+                    percentText = body.optString("percent", null);
+                } else if (body.has("value")) {
+                    percentText = body.optString("value", null);
+                }
+            } catch (Exception e) {
+                return volumeResponse("set", null, null, false, "invalid json body", 400);
+            }
+        }
+
+        try {
+            if (levelText != null) {
+                int level = Integer.parseInt(levelText);
+                int max = volumeOperator.getMaxVolume();
+                if (level < 1 || level > max) {
+                    return volumeResponse("set", Integer.valueOf(level), null, false,
+                            "level must be between 1 and " + max, 400);
+                }
+                volumeOperator.setVoiceVolume(level);
+                return volumeResponse("set", Integer.valueOf(level), null, true, null, 200);
+            }
+            if (percentText != null) {
+                int percent = Integer.parseInt(percentText);
+                if (percent < 0 || percent > 100) {
+                    return volumeResponse("set", null, Integer.valueOf(percent), false,
+                            "percent must be between 0 and 100", 400);
+                }
+                int max = volumeOperator.getMaxVolume();
+                int level = Math.max(1, Math.round(((float) max) * (((float) percent) / 100.0f)));
+                volumeOperator.setVoiceVolume(level);
+                return volumeResponse("set", Integer.valueOf(level), Integer.valueOf(percent), true, null, 200);
+            }
+        } catch (NumberFormatException e) {
+            return volumeResponse("set", null, null, false, "invalid volume number", 400);
+        }
+        return volumeResponse("set", null, null, false,
+                "missing percent/value or level parameter", 400);
+    }
+
+    private Response volumeResponse(String action, Integer requestedLevel, Integer requestedPercent,
+                                    boolean ok, String error, int status) throws Exception {
+        DefaultVolumeOperator volumeOperator = DefaultVolumeOperator.getInstance(this.context);
+        int current = volumeOperator.getCurrentVolume();
+        int max = volumeOperator.getMaxVolume();
+        JSONObject json = new JSONObject();
+        json.put("ok", ok);
+        json.put("action", action);
+        json.put("current", current);
+        json.put("max", max);
+        json.put("percent", max > 0 ? Math.round((((float) current) / ((float) max)) * 100.0f) : 0);
+        if (requestedLevel != null) {
+            json.put("requestedLevel", requestedLevel.intValue());
+        }
+        if (requestedPercent != null) {
+            json.put("requestedPercent", requestedPercent.intValue());
+        }
+        if (error != null) {
+            json.put("error", error);
+        }
+        return new Response(status, null, null, null, null, json.toString().getBytes("UTF-8"));
+    }
+
+    private static String queryParam(String target, String name) {
+        if (target == null) {
+            return null;
+        }
+        int query = target.indexOf('?');
+        if (query < 0 || query == target.length() - 1) {
+            return null;
+        }
+        String[] pairs = target.substring(query + 1).split("&");
+        for (String pair : pairs) {
+            int equals = pair.indexOf('=');
+            String key = equals >= 0 ? pair.substring(0, equals) : pair;
+            if (name.equals(key)) {
+                return equals >= 0 ? pair.substring(equals + 1) : "";
+            }
+        }
+        return null;
+    }
+
+    private static boolean isApiMethod(String method) {
+        return "GET".equals(method) || "POST".equals(method);
+    }
+
+    private static boolean isBluetoothPath(String path) {
+        return path != null && (path.equals("/api/bluetooth") || path.equals("/bluetooth")
+                || path.startsWith("/api/bluetooth/") || path.startsWith("/bluetooth/"));
+    }
+
+    private static boolean isVolumePath(String path) {
+        return path != null && (path.equals("/api/volume") || path.equals("/volume")
+                || path.startsWith("/api/volume/") || path.startsWith("/volume/"));
+    }
+
+    private static boolean isPath(String path, String expect) {
+        return expect.equals(path);
+    }
+
+    private static String pathOnly(String path) {
+        if (path == null) {
+            return "";
+        }
+        int query = path.indexOf('?');
+        if (query >= 0) {
+            path = path.substring(0, query);
+        }
+        return path;
     }
 
     private int forwardR1Frames(String uuid, byte[] body) {
