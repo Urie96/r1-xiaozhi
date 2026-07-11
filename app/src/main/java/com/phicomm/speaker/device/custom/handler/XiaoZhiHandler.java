@@ -119,21 +119,26 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         }
         String sessionId = sessionIdFrom(evt);
         if (!isValidSessionId(sessionId)) {
-            LogMgr.e(TAG, "ignore invalid xiaozhi session id: " + sessionId + ", service=" + evt.getService());
-            return false;
+            LogMgr.e(TAG, "swallow local nlu: " + sessionId + ", service=" + evt.getService());
+            return true;
         }
         return true;
     }
 
     @Override
     public void eventReceived(final NLU evt, final ANTHandlerContext ctx) throws Exception {
+        final String uuid = sessionIdFrom(evt);
+        if (!isValidSessionId(uuid)) {
+            LogMgr.d(TAG, "local nlu ignored: " + uuid + ", service=" + evt.getService());
+            return;
+        }
+
         super.eventReceived(evt, ctx);
         this.ctx = ctx;
         this.interrupted = false;
         this.active = true;
         this.playingRemoteAudio = false;
 
-        final String uuid = sessionIdFrom(evt);
         LogMgr.d(TAG, "session uuid: " + uuid);
 
         cancelCurrentSession();
