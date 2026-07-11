@@ -10,6 +10,8 @@ import com.unisound.vui.handler.SimpleUserEventInboundHandler;
 import com.unisound.vui.util.ExoConstants;
 import com.unisound.vui.util.LogMgr;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import nluparser.scheme.NLU;
 import nluparser.scheme.SName;
 
@@ -25,6 +27,7 @@ import nluparser.scheme.SName;
  */
 public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String TAG = "XiaoZhiHandler";
+    private static final long ENTER_ASR_DELAY_MS = 500L;
 
     private ANTHandlerContext ctx;
     private XiaoZhiBridgeManager bridgeManager;
@@ -32,6 +35,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     private volatile boolean interrupted;
     private volatile boolean active;
     private volatile boolean playingRemoteAudio;
+    private final AtomicInteger enterAsrDelayGeneration = new AtomicInteger();
 
     public XiaoZhiHandler() {
         this.sessionName = SessionRegister.SESSION_CHAT;
@@ -109,6 +113,21 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     }
 
     @Override
+    public void userEventTriggered(Object evt, ANTHandlerContext ctx) throws Exception {
+        if (evt instanceof NLU) {
+            NLU nlu = (NLU) evt;
+            if (!SName.ERROR_REPORT.equals(nlu.getService())) {
+                String sessionId = sessionIdFrom(nlu);
+                if (!isValidSessionId(sessionId)) {
+                    LogMgr.e(TAG, "swallow local nlu without interrupt: " + sessionId + ", service=" + nlu.getService());
+                    return;
+                }
+            }
+        }
+        super.userEventTriggered(evt, ctx);
+    }
+
+    @Override
     public boolean acceptInboundEvent0(NLU evt) throws Exception {
         if (evt == null) {
             return false;
@@ -119,8 +138,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         }
         String sessionId = sessionIdFrom(evt);
         if (!isValidSessionId(sessionId)) {
-            LogMgr.e(TAG, "swallow local nlu: " + sessionId + ", service=" + evt.getService());
-            return true;
+            return false;
         }
         return true;
     }
@@ -150,6 +168,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
             bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
             bridgeManager.startLocalHttpServer();
         }
+        final int serverCloseGeneration = bridgeManager.serverCloseGeneration();
         XiaoZhiTurn turn = bridgeManager.takeTurn(uuid);
         if (turn == null) {
             LogMgr.e(TAG, "missing xiaozhi turn: " + uuid);
@@ -172,10 +191,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         LogMgr.d(TAG, "xiaozhi playback ended");
                         playingRemoteAudio = false;
                         session = null;
-                        if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                            XiaoZhiHandler.this.ctx.enterASR();
-                        }
-                        reset();
+                        enterASRAfterPlaybackSettled(serverCloseGeneration);
                     }
 
                     @Override
@@ -183,10 +199,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         LogMgr.d(TAG, "xiaozhi no tts audio, enter ASR");
                         playingRemoteAudio = false;
                         session = null;
-                        if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                            XiaoZhiHandler.this.ctx.enterASR();
-                        }
-                        reset();
+                        enterASRAfterPlaybackSettled(serverCloseGeneration);
                     }
 
                     @Override
@@ -244,8 +257,48 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     public void reset() {
         this.active = false;
         this.playingRemoteAudio = false;
+        this.enterAsrDelayGeneration.incrementAndGet();
         cancelCurrentSession();
         super.reset();
+    }
+
+    private void enterASRAfterPlaybackSettled(final int serverCloseGeneration) {
+        final ANTHandlerContext targetCtx = this.ctx;
+        if (this.interrupted || targetCtx == null) {
+            reset();
+            return;
+        }
+        if (this.bridgeManager != null && this.bridgeManager.hasServerCloseSince(serverCloseGeneration)) {
+            LogMgr.d(TAG, "server closed during playback, stay wakeup");
+            targetCtx.enterWakeup(false);
+            reset();
+            return;
+        }
+        final int generation = this.enterAsrDelayGeneration.incrementAndGet();
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(ENTER_ASR_DELAY_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (enterAsrDelayGeneration.get() != generation || interrupted || XiaoZhiHandler.this.ctx != targetCtx) {
+                    return;
+                }
+                if (bridgeManager != null && bridgeManager.hasServerCloseSince(serverCloseGeneration)) {
+                    LogMgr.d(TAG, "server closed before enter ASR, stay wakeup");
+                    targetCtx.enterWakeup(false);
+                    reset();
+                    return;
+                }
+                targetCtx.enterASR();
+                reset();
+            }
+        }, "xiaozhi-enter-asr-delay");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     private void cancelCurrentSession() {

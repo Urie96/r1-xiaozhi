@@ -23,6 +23,7 @@ import java.net.SocketTimeoutException;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class XiaoZhiBridgeManager {
     private static final String TAG = "XiaoZhiBridge";
@@ -35,6 +36,7 @@ public final class XiaoZhiBridgeManager {
     private final XiaoZhiUpstreamClient upstream;
     private final PhicommXController phicommXController;
     private final Map<String, ActiveSession> active = new HashMap<String, ActiveSession>();
+    private final AtomicInteger serverCloseGeneration = new AtomicInteger();
     private volatile ANTHandlerContext antContext;
     private volatile boolean serverStarted;
 
@@ -91,7 +93,16 @@ public final class XiaoZhiBridgeManager {
         upstream.cancelTurn(uuid);
     }
 
+    public int serverCloseGeneration() {
+        return serverCloseGeneration.get();
+    }
+
+    public boolean hasServerCloseSince(int generation) {
+        return serverCloseGeneration.get() != generation;
+    }
+
     private void enterWakeupFromServerClose() {
+        serverCloseGeneration.incrementAndGet();
         ANTHandlerContext ctx = this.antContext;
         if (ctx != null) {
             LogMgr.d(TAG, "server closed conversation, enter wakeup");
