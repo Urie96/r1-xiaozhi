@@ -19,14 +19,19 @@ import okhttp3.WebSocketListener;
 import okio.ByteString;
 
 public final class XiaoZhiUpstreamClient {
+    public interface ConversationCloseListener {
+        void onConversationClosed();
+    }
+
     private static final String TAG = "XiaoZhiUpstream";
-    private static final int PROTOCOL_VERSION = 1;
+    private static final int PROTOCOL_VERSION = 3;
 
     private final OkHttpClient client;
     private final String wsUrl;
     private final String token;
     private final Object lock = new Object();
     private final Map<String, XiaoZhiTurn> turns = new HashMap<String, XiaoZhiTurn>();
+    private final ConversationCloseListener closeListener;
 
     private WebSocket webSocket;
     private String deviceId = "feixun-r1";
@@ -36,10 +41,15 @@ public final class XiaoZhiUpstreamClient {
     private boolean pendingStop;
     private boolean connecting;
     private boolean connected;
+    private boolean helloReceived;
+    private boolean listenStarted;
+    private boolean serverTtsStarted;
+    private boolean serverAudioReceived;
 
-    public XiaoZhiUpstreamClient(String wsUrl, String token) {
+    public XiaoZhiUpstreamClient(String wsUrl, String token, ConversationCloseListener closeListener) {
         this.wsUrl = normalizeWsUrl(wsUrl);
         this.token = token == null ? "" : token.trim();
+        this.closeListener = closeListener;
         this.client = new OkHttpClient.Builder()
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
@@ -57,15 +67,12 @@ public final class XiaoZhiUpstreamClient {
                 turns.remove(currentTurn.uuid());
                 currentTurn.cancel();
             }
-            pendingAudio.clear();
-            pendingStop = false;
+            resetTurnStateLocked();
             currentTurn = turn;
             turns.put(turn.uuid(), turn);
         }
         ensureConnected();
-        if (isConnected() && !sendListenStart()) {
-            turn.fail("xiaozhi websocket unavailable");
-        }
+        flushPendingIfReady();
         return turn;
     }
 
@@ -82,13 +89,18 @@ public final class XiaoZhiUpstreamClient {
             if (turn == null || turn != currentTurn) {
                 return;
             }
-            ws = connected ? webSocket : null;
-            if (ws == null) {
+            if (!readyForAudioLocked()) {
                 pendingAudio.add(opusPacket);
-                return;
+                ws = null;
+            } else {
+                ws = webSocket;
             }
         }
-        if (!ws.send(ByteString.of(opusPacket))) {
+        if (ws == null) {
+            flushPendingIfReady();
+            return;
+        }
+        if (!sendAudioFrame(ws, opusPacket)) {
             failCurrent("send audio to xiaozhi websocket failed");
         }
     }
@@ -100,11 +112,16 @@ public final class XiaoZhiUpstreamClient {
             if (turn == null || turn != currentTurn) {
                 return;
             }
-            ws = connected ? webSocket : null;
-            if (ws == null) {
+            if (!readyForAudioLocked()) {
                 pendingStop = true;
-                return;
+                ws = null;
+            } else {
+                ws = webSocket;
             }
+        }
+        if (ws == null) {
+            flushPendingIfReady();
+            return;
         }
         if (!ws.send(listenStop())) {
             failCurrent("send listen.stop to xiaozhi websocket failed");
@@ -126,8 +143,7 @@ public final class XiaoZhiUpstreamClient {
             }
             if (turn != null && turn == currentTurn) {
                 currentTurn = null;
-                pendingAudio.clear();
-                pendingStop = false;
+                resetTurnStateLocked();
                 ws = connected ? webSocket : null;
             }
         }
@@ -152,25 +168,12 @@ public final class XiaoZhiUpstreamClient {
         if (token.length() > 0) {
             builder.header("Authorization", "Bearer " + token);
         }
-        LogMgr.d(TAG, "connect " + wsUrl + ", deviceId=" + deviceId);
+        LogMgr.d(TAG, "connect " + wsUrl + ", deviceId=" + deviceId + ", protocol=v" + PROTOCOL_VERSION);
         client.newWebSocket(builder.build(), new Listener());
     }
 
-    private boolean isConnected() {
-        synchronized (lock) {
-            return connected && webSocket != null;
-        }
-    }
-
-    private boolean sendListenStart() {
-        WebSocket ws;
-        synchronized (lock) {
-            ws = webSocket;
-        }
-        if (ws == null) {
-            return false;
-        }
-        return ws.send(listenStart());
+    private boolean readyForAudioLocked() {
+        return connected && helloReceived && listenStarted && webSocket != null;
     }
 
     private void handleOpen(WebSocket ws) {
@@ -178,31 +181,39 @@ public final class XiaoZhiUpstreamClient {
             webSocket = ws;
             connected = true;
             connecting = false;
+            helloReceived = false;
+            serverSessionId = null;
         }
-        ws.send(hello());
-        flushPendingAfterOpen(ws);
+        if (!ws.send(hello())) {
+            failCurrent("send hello to xiaozhi websocket failed");
+        }
     }
 
-    private void flushPendingAfterOpen(WebSocket ws) {
+    private void flushPendingIfReady() {
+        WebSocket ws;
         List<byte[]> audio;
         boolean stop;
-        XiaoZhiTurn turn;
+        boolean start;
         synchronized (lock) {
-            turn = currentTurn;
+            if (!connected || !helloReceived || webSocket == null || currentTurn == null) {
+                return;
+            }
+            ws = webSocket;
+            start = !listenStarted;
+            if (start) {
+                listenStarted = true;
+            }
             audio = new ArrayList<byte[]>(pendingAudio);
             pendingAudio.clear();
             stop = pendingStop;
             pendingStop = false;
         }
-        if (turn == null) {
-            return;
-        }
-        if (!ws.send(listenStart())) {
-            failCurrent("send listen.start after websocket open failed");
+        if (start && !ws.send(listenStart())) {
+            failCurrent("send listen.start to xiaozhi websocket failed");
             return;
         }
         for (int i = 0; i < audio.size(); i++) {
-            if (!ws.send(ByteString.of(audio.get(i)))) {
+            if (!sendAudioFrame(ws, audio.get(i))) {
                 failCurrent("flush pending audio to xiaozhi websocket failed");
                 return;
             }
@@ -217,19 +228,35 @@ public final class XiaoZhiUpstreamClient {
             JSONObject json = new JSONObject(text);
             String type = json.optString("type", "");
             if ("hello".equals(type)) {
-                serverSessionId = json.optString("session_id", null);
+                synchronized (lock) {
+                    serverSessionId = json.optString("session_id", null);
+                    helloReceived = true;
+                }
                 LogMgr.d(TAG, "server hello session=" + serverSessionId);
+                flushPendingIfReady();
                 return;
             }
             if ("stt".equals(type)) {
                 LogMgr.d(TAG, "stt=" + json.optString("text", ""));
                 return;
             }
+            if ("llm".equals(type)) {
+                LogMgr.d(TAG, "llm=" + json.optString("text", ""));
+                return;
+            }
             if ("tts".equals(type)) {
                 String state = json.optString("state", "");
                 LogMgr.d(TAG, "tts state=" + state + ", text=" + json.optString("text", ""));
-                if ("stop".equals(state)) {
-                    finishCurrentFromServer();
+                if ("start".equals(state) || "sentence_start".equals(state)) {
+                    synchronized (lock) {
+                        serverTtsStarted = true;
+                    }
+                } else if ("stop".equals(state)) {
+                    if (shouldFinishOnTtsStop()) {
+                        finishCurrentAudioFromServer();
+                    } else {
+                        LogMgr.d(TAG, "ignore tts.stop before server tts/audio");
+                    }
                 }
                 return;
             }
@@ -242,22 +269,33 @@ public final class XiaoZhiUpstreamClient {
     }
 
     private void handleAudio(ByteString bytes) {
+        byte[] audio = decodeAudioFrame(bytes.toByteArray());
+        if (audio == null || audio.length == 0) {
+            LogMgr.e(TAG, "drop invalid xiaozhi audio frame, bytes=" + bytes.size());
+            return;
+        }
         XiaoZhiTurn turn;
         synchronized (lock) {
+            serverAudioReceived = true;
             turn = currentTurn;
         }
         if (turn != null) {
-            turn.offerAudio(bytes.toByteArray());
+            turn.offerAudio(audio);
         }
     }
 
-    private void finishCurrentFromServer() {
+    private boolean shouldFinishOnTtsStop() {
+        synchronized (lock) {
+            return serverTtsStarted || serverAudioReceived;
+        }
+    }
+
+    private void finishCurrentAudioFromServer() {
         XiaoZhiTurn turn;
         synchronized (lock) {
             turn = currentTurn;
             currentTurn = null;
-            pendingAudio.clear();
-            pendingStop = false;
+            resetTurnStateLocked();
         }
         if (turn != null) {
             turn.finish();
@@ -269,8 +307,7 @@ public final class XiaoZhiUpstreamClient {
         synchronized (lock) {
             turn = currentTurn;
             currentTurn = null;
-            pendingAudio.clear();
-            pendingStop = false;
+            resetTurnStateLocked();
         }
         if (turn != null) {
             turn.fail(message);
@@ -278,22 +315,49 @@ public final class XiaoZhiUpstreamClient {
         LogMgr.e(TAG, message);
     }
 
-    private void handleClosedOrFailed(String message) {
-        XiaoZhiTurn turn;
+    private void handleFailure(WebSocket ws, String message) {
+        XiaoZhiTurn turn = null;
         synchronized (lock) {
+            if (ws != webSocket) {
+                LogMgr.e(TAG, message + " (stale websocket)");
+                return;
+            }
             webSocket = null;
             connected = false;
             connecting = false;
+            helloReceived = false;
             serverSessionId = null;
             turn = currentTurn;
             currentTurn = null;
-            pendingAudio.clear();
-            pendingStop = false;
+            resetTurnStateLocked();
         }
         if (turn != null) {
             turn.fail(message);
         }
         LogMgr.e(TAG, message);
+    }
+
+    private void handleClosed(WebSocket ws, String message) {
+        XiaoZhiTurn turn = null;
+        synchronized (lock) {
+            if (ws != webSocket) {
+                LogMgr.d(TAG, message + " (stale websocket)");
+                return;
+            }
+            webSocket = null;
+            connected = false;
+            connecting = false;
+            helloReceived = false;
+            serverSessionId = null;
+            turn = currentTurn;
+            currentTurn = null;
+            resetTurnStateLocked();
+        }
+        boolean deliveredToTurn = turn != null && turn.close();
+        LogMgr.d(TAG, message);
+        if (!deliveredToTurn && closeListener != null) {
+            closeListener.onConversationClosed();
+        }
     }
 
     private String hello() throws RuntimeException {
@@ -350,12 +414,89 @@ public final class XiaoZhiUpstreamClient {
     private String abort() {
         try {
             JSONObject json = new JSONObject();
+            if (serverSessionId != null) {
+                json.put("session_id", serverSessionId);
+            }
             json.put("type", "abort");
             json.put("reason", "client cancel");
             return json.toString();
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private void resetTurnStateLocked() {
+        pendingAudio.clear();
+        pendingStop = false;
+        listenStarted = false;
+        serverTtsStarted = false;
+        serverAudioReceived = false;
+    }
+
+    private static boolean sendAudioFrame(WebSocket ws, byte[] opusPacket) {
+        return ws.send(ByteString.of(encodeAudioFrame(opusPacket)));
+    }
+
+    private static byte[] encodeAudioFrame(byte[] opusPacket) {
+        if (PROTOCOL_VERSION == 1) {
+            return opusPacket;
+        }
+        if (PROTOCOL_VERSION == 3) {
+            byte[] frame = new byte[4 + opusPacket.length];
+            frame[0] = 0;
+            frame[1] = 0;
+            frame[2] = (byte) ((opusPacket.length >> 8) & 0xff);
+            frame[3] = (byte) (opusPacket.length & 0xff);
+            System.arraycopy(opusPacket, 0, frame, 4, opusPacket.length);
+            return frame;
+        }
+        byte[] frame = new byte[16 + opusPacket.length];
+        frame[0] = 0;
+        frame[1] = 2;
+        frame[2] = 0;
+        frame[3] = 0;
+        frame[12] = (byte) ((opusPacket.length >> 24) & 0xff);
+        frame[13] = (byte) ((opusPacket.length >> 16) & 0xff);
+        frame[14] = (byte) ((opusPacket.length >> 8) & 0xff);
+        frame[15] = (byte) (opusPacket.length & 0xff);
+        System.arraycopy(opusPacket, 0, frame, 16, opusPacket.length);
+        return frame;
+    }
+
+    private static byte[] decodeAudioFrame(byte[] frame) {
+        if (frame == null || frame.length == 0) {
+            return null;
+        }
+        if (PROTOCOL_VERSION == 1) {
+            return frame;
+        }
+        if (PROTOCOL_VERSION == 3) {
+            if (frame.length < 4 || (frame[0] & 0xff) != 0) {
+                return null;
+            }
+            int payloadSize = ((frame[2] & 0xff) << 8) | (frame[3] & 0xff);
+            if (payloadSize < 0 || payloadSize > frame.length - 4) {
+                return null;
+            }
+            byte[] payload = new byte[payloadSize];
+            System.arraycopy(frame, 4, payload, 0, payloadSize);
+            return payload;
+        }
+        if (frame.length < 16) {
+            return null;
+        }
+        int type = ((frame[2] & 0xff) << 8) | (frame[3] & 0xff);
+        if (type != 0) {
+            return null;
+        }
+        int payloadSize = ((frame[12] & 0xff) << 24) | ((frame[13] & 0xff) << 16)
+                | ((frame[14] & 0xff) << 8) | (frame[15] & 0xff);
+        if (payloadSize < 0 || payloadSize > frame.length - 16) {
+            return null;
+        }
+        byte[] payload = new byte[payloadSize];
+        System.arraycopy(frame, 16, payload, 0, payloadSize);
+        return payload;
     }
 
     private static String normalizeWsUrl(String url) {
@@ -395,13 +536,19 @@ public final class XiaoZhiUpstreamClient {
         }
 
         @Override
+        public void onClosing(WebSocket webSocket, int code, String reason) {
+            handleClosed(webSocket, "xiaozhi websocket closing: " + code + ", " + reason);
+            webSocket.close(code, reason);
+        }
+
+        @Override
         public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-            handleClosedOrFailed("xiaozhi websocket failed: " + t.toString());
+            handleFailure(webSocket, "xiaozhi websocket failed: " + t.toString());
         }
 
         @Override
         public void onClosed(WebSocket webSocket, int code, String reason) {
-            handleClosedOrFailed("xiaozhi websocket closed: " + code + ", " + reason);
+            handleClosed(webSocket, "xiaozhi websocket closed: " + code + ", " + reason);
         }
     }
 }

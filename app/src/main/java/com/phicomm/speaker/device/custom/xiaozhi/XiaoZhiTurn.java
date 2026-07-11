@@ -8,6 +8,7 @@ public final class XiaoZhiTurn {
     static final int EVENT_AUDIO = 1;
     static final int EVENT_FINISH = 2;
     static final int EVENT_ERROR = 3;
+    static final int EVENT_CLOSE = 4;
 
     static final class Event {
         final int type;
@@ -30,6 +31,10 @@ public final class XiaoZhiTurn {
 
         static Event error(String message) {
             return new Event(EVENT_ERROR, null, message);
+        }
+
+        static Event close() {
+            return new Event(EVENT_CLOSE, null, null);
         }
     }
 
@@ -68,6 +73,14 @@ public final class XiaoZhiTurn {
         if (completed.compareAndSet(false, true)) {
             queue.offer(Event.error(message));
         }
+    }
+
+    boolean close() {
+        if (completed.compareAndSet(false, true)) {
+            queue.offer(Event.close());
+            return true;
+        }
+        return false;
     }
 
     public void cancel() {

@@ -40,7 +40,12 @@ public final class XiaoZhiBridgeManager {
 
     private XiaoZhiBridgeManager(Context context) {
         this.context = context;
-        this.upstream = new XiaoZhiUpstreamClient(config("xiaozhi_ws", "ws://home.lubui.com:3116/ws"), config("xiaozhi_token", "dev-token"));
+        this.upstream = new XiaoZhiUpstreamClient(config("xiaozhi_ws", "ws://home.lubui.com:3116/ws"), config("xiaozhi_token", "dev-token"), new XiaoZhiUpstreamClient.ConversationCloseListener() {
+            @Override
+            public void onConversationClosed() {
+                enterWakeupFromServerClose();
+            }
+        });
         this.phicommXController = new PhicommXController(context);
     }
 
@@ -86,14 +91,29 @@ public final class XiaoZhiBridgeManager {
         upstream.cancelTurn(uuid);
     }
 
+    private void enterWakeupFromServerClose() {
+        ANTHandlerContext ctx = this.antContext;
+        if (ctx != null) {
+            LogMgr.d(TAG, "server closed conversation, enter wakeup");
+            ctx.enterWakeup(false);
+        }
+    }
+
     private void serveLoop() {
         ServerSocket serverSocket = null;
         try {
             serverSocket = new ServerSocket(LOCAL_TR_PORT);
             LogMgr.d(TAG, "local http listening on " + LOCAL_TR_ADDR);
             while (true) {
-                Socket socket = serverSocket.accept();
-                handleSocket(socket);
+                final Socket socket = serverSocket.accept();
+                Thread thread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleSocket(socket);
+                    }
+                }, "xiaozhi-http-client");
+                thread.setDaemon(true);
+                thread.start();
             }
         } catch (Throwable t) {
             LogMgr.e(TAG, "local http server stopped: " + t.toString());
@@ -111,30 +131,25 @@ public final class XiaoZhiBridgeManager {
     private void handleSocket(Socket socket) {
         try {
             socket.setSoTimeout(15000);
-            Request request = readRequest(socket.getInputStream());
-            if (request == null) {
-                return;
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+            while (true) {
+                Request request;
+                try {
+                    request = readRequest(in);
+                } catch (SocketTimeoutException e) {
+                    return;
+                }
+                if (request == null) {
+                    return;
+                }
+                Response response = handleRequest(request);
+                boolean keepAlive = shouldKeepAlive(request);
+                writeResponse(out, response, keepAlive);
+                if (!keepAlive) {
+                    return;
+                }
             }
-            Response response;
-            String path = pathOnly(request.path);
-            if ("OPTIONS".equals(request.method)) {
-                response = new Response(204, null, null, null, null, new byte[0]);
-            } else if ("POST".equals(request.method) && "/trafficRouter/cs".equals(path)) {
-                response = handleTraffic(request);
-            } else if ("GET".equals(request.method) && "/health".equals(path)) {
-                response = new Response(200, null, null, null, null, "{\"status\":\"ok\"}".getBytes("UTF-8"));
-            } else if (isBluetoothRoute(request.method, path)) {
-                response = handleBluetooth(path);
-            } else if (isVolumeRoute(request.method, path)) {
-                response = handleVolume(request);
-            } else if (isAsrRoute(request.method, path)) {
-                response = handleAsr(path);
-            } else {
-                response = new Response(404, null, null, null, null, new byte[0]);
-            }
-            writeResponse(socket.getOutputStream(), response);
-        } catch (SocketTimeoutException e) {
-            LogMgr.e(TAG, "local http timeout: " + e.toString());
         } catch (Throwable t) {
             LogMgr.e(TAG, "handle local http failed: " + t.toString());
         } finally {
@@ -143,6 +158,29 @@ public final class XiaoZhiBridgeManager {
             } catch (IOException ignored) {
             }
         }
+    }
+
+    private Response handleRequest(Request request) throws Exception {
+        String path = pathOnly(request.path);
+        if ("OPTIONS".equals(request.method)) {
+            return new Response(204, null, null, null, null, new byte[0]);
+        }
+        if ("POST".equals(request.method) && "/trafficRouter/cs".equals(path)) {
+            return handleTraffic(request);
+        }
+        if ("GET".equals(request.method) && "/health".equals(path)) {
+            return new Response(200, null, null, null, null, "{\"status\":\"ok\"}".getBytes("UTF-8"));
+        }
+        if (isBluetoothRoute(request.method, path)) {
+            return handleBluetooth(path);
+        }
+        if (isVolumeRoute(request.method, path)) {
+            return handleVolume(request);
+        }
+        if (isAsrRoute(request.method, path)) {
+            return handleAsr(path);
+        }
+        return new Response(404, null, null, null, null, new byte[0]);
     }
 
     private Response handleTraffic(Request request) throws Exception {
@@ -486,6 +524,7 @@ public final class XiaoZhiBridgeManager {
         if (parts.length < 2) {
             return null;
         }
+        String version = parts.length >= 3 ? parts[2] : "HTTP/1.0";
         Map<String, String> headers = new HashMap<String, String>();
         String line;
         while ((line = readLine(in)) != null && line.length() > 0) {
@@ -495,7 +534,7 @@ public final class XiaoZhiBridgeManager {
             }
         }
         byte[] body = readBody(in, headers);
-        return new Request(parts[0], parts[1], headers, body);
+        return new Request(parts[0], parts[1], version, headers, body);
     }
 
     private static byte[] readBody(InputStream in, Map<String, String> headers) throws IOException {
@@ -582,7 +621,7 @@ public final class XiaoZhiBridgeManager {
         return new Response(200, sid, pn, ct, rs, body);
     }
 
-    private static void writeResponse(OutputStream out, Response response) throws IOException {
+    private static void writeResponse(OutputStream out, Response response, boolean keepAlive) throws IOException {
         byte[] body = response.body == null ? new byte[0] : response.body;
         StringBuilder sb = new StringBuilder();
         sb.append("HTTP/1.1 ").append(response.status).append(" \r\n");
@@ -603,10 +642,32 @@ public final class XiaoZhiBridgeManager {
             sb.append("SID: ").append(response.sid).append("\r\n");
         }
         sb.append("Content-Length: ").append(body.length).append("\r\n");
+        sb.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n");
         sb.append("\r\n");
         out.write(sb.toString().getBytes("ISO-8859-1"));
         out.write(body);
         out.flush();
+    }
+
+    private static boolean shouldKeepAlive(Request request) {
+        String connection = header(request.headers, "Connection");
+        if (connection != null && containsToken(connection, "close")) {
+            return false;
+        }
+        if ("HTTP/1.1".equalsIgnoreCase(request.version)) {
+            return true;
+        }
+        return connection != null && containsToken(connection, "keep-alive");
+    }
+
+    private static boolean containsToken(String headerValue, String token) {
+        String[] parts = headerValue.split(",");
+        for (String part : parts) {
+            if (token.equalsIgnoreCase(part.trim())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String header(Map<String, String> headers, String name) {
@@ -672,12 +733,14 @@ public final class XiaoZhiBridgeManager {
     private static final class Request {
         final String method;
         final String path;
+        final String version;
         final Map<String, String> headers;
         final byte[] body;
 
-        Request(String method, String path, Map<String, String> headers, byte[] body) {
+        Request(String method, String path, String version, Map<String, String> headers, byte[] body) {
             this.method = method;
             this.path = path;
+            this.version = version;
             this.headers = headers;
             this.body = body;
         }

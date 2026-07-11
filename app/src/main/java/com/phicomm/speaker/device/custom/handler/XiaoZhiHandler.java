@@ -21,7 +21,7 @@ import nluparser.scheme.SName;
  *        → 本地 HTTP 服务返回携带 UUID 的假 NLU
  *        → XiaoZhiHandler 用 UUID 取得本轮 TTS 队列
  *        → ExoPlayer 通过自定义 DataSource 边收边播 Ogg Opus
- *        → 有 TTS 音频则播完 enterASR 连续对话；无音频则退回未唤醒
+ *        → 普通 TTS 结束后 enterASR 连续对话；服务端 WebSocket close 才退回未唤醒
  */
 public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String TAG = "XiaoZhiHandler";
@@ -175,11 +175,11 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
 
                     @Override
                     public void onNoAudio() {
-                        LogMgr.d(TAG, "xiaozhi no tts audio, enter wakeup");
+                        LogMgr.d(TAG, "xiaozhi no tts audio, enter ASR");
                         playingRemoteAudio = false;
                         session = null;
                         if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                            XiaoZhiHandler.this.ctx.enterASR();
                         }
                         reset();
                     }
@@ -192,6 +192,17 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         if (!interrupted && XiaoZhiHandler.this.ctx != null) {
                             XiaoZhiHandler.this.ctx.playTTS("小智服务暂时不可用，请稍后再试");
                         }
+                    }
+
+                    @Override
+                    public void onConversationClosed() {
+                        LogMgr.d(TAG, "xiaozhi conversation closed, enter wakeup");
+                        playingRemoteAudio = false;
+                        session = null;
+                        if (!interrupted && XiaoZhiHandler.this.ctx != null) {
+                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                        }
+                        reset();
                     }
                 }
         );

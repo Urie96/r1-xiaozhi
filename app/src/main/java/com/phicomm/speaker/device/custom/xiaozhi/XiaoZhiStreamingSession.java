@@ -16,6 +16,8 @@ public final class XiaoZhiStreamingSession {
         void onNoAudio();
 
         void onError(String errorMessage);
+
+        void onConversationClosed();
     }
 
     private static final String TAG = "XiaoZhiSession";
@@ -111,6 +113,9 @@ public final class XiaoZhiStreamingSession {
                 } else if (event.type == XiaoZhiTurn.EVENT_ERROR) {
                     fail(event.message == null ? "xiaozhi turn failed" : event.message);
                     return;
+                } else if (event.type == XiaoZhiTurn.EVENT_CLOSE) {
+                    finishClosed();
+                    return;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -129,6 +134,7 @@ public final class XiaoZhiStreamingSession {
             if (dataSource != null && muxer != null) {
                 dataSource.feed(muxer.buildEndPage());
                 dataSource.finish();
+                startEndWatchdog();
             }
         } catch (IOException e) {
             fail("finish ogg stream failed: " + e.toString());
@@ -151,6 +157,25 @@ public final class XiaoZhiStreamingSession {
         } catch (IOException e) {
             fail("mux opus frame failed: " + e.toString());
         }
+    }
+
+    private void startEndWatchdog() {
+        Thread watchdog = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(4000L);
+                } catch (InterruptedException ignored) {
+                    return;
+                }
+                if (!canceled.get() && !finished.get()) {
+                    LogMgr.e(TAG, "stream ended without player callback, force finish");
+                    finishNormally();
+                }
+            }
+        }, "xiaozhi-stream-end-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     private void finishNoAudio() {
@@ -188,6 +213,25 @@ public final class XiaoZhiStreamingSession {
         }
         if (!canceled.get() && callback != null) {
             callback.onPlaybackEnded();
+        }
+    }
+
+    private void finishClosed() {
+        if (!finished.compareAndSet(false, true)) {
+            return;
+        }
+        LogMgr.d(TAG, "conversation closed by server");
+        completeTurn();
+        if (dataSource != null) {
+            dataSource.cancel();
+            dataSource = null;
+        }
+        if (player != null) {
+            player.stop();
+            player = null;
+        }
+        if (!canceled.get() && callback != null) {
+            callback.onConversationClosed();
         }
     }
 
