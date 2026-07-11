@@ -152,6 +152,32 @@ public final class XiaoZhiUpstreamClient {
         }
     }
 
+    public void closeConnection() {
+        WebSocket ws;
+        XiaoZhiTurn turn;
+        synchronized (lock) {
+            ws = webSocket;
+            webSocket = null;
+            connected = false;
+            connecting = false;
+            helloReceived = false;
+            serverSessionId = null;
+            turn = currentTurn;
+            currentTurn = null;
+            if (turn != null) {
+                turns.remove(turn.uuid());
+            }
+            resetTurnStateLocked();
+        }
+        if (turn != null) {
+            turn.cancel();
+        }
+        if (ws != null) {
+            LogMgr.d(TAG, "close websocket for enter wakeup");
+            ws.close(1000, "enter wakeup");
+        }
+    }
+
     private void ensureConnected() {
         synchronized (lock) {
             if (connected || connecting) {
@@ -169,7 +195,17 @@ public final class XiaoZhiUpstreamClient {
             builder.header("Authorization", "Bearer " + token);
         }
         LogMgr.d(TAG, "connect " + wsUrl + ", deviceId=" + deviceId + ", protocol=v" + PROTOCOL_VERSION);
-        client.newWebSocket(builder.build(), new Listener());
+        WebSocket connectingSocket = client.newWebSocket(builder.build(), new Listener());
+        boolean keepSocket;
+        synchronized (lock) {
+            keepSocket = connecting && webSocket == null;
+            if (keepSocket) {
+                webSocket = connectingSocket;
+            }
+        }
+        if (!keepSocket) {
+            connectingSocket.close(1000, "connection no longer needed");
+        }
     }
 
     private boolean readyForAudioLocked() {
@@ -178,7 +214,10 @@ public final class XiaoZhiUpstreamClient {
 
     private void handleOpen(WebSocket ws) {
         synchronized (lock) {
-            webSocket = ws;
+            if (ws != webSocket) {
+                ws.close(1000, "stale connection");
+                return;
+            }
             connected = true;
             connecting = false;
             helloReceived = false;

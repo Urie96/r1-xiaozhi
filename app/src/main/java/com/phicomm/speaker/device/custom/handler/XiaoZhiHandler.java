@@ -125,7 +125,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                 if (!isValidSessionId(sessionId)) {
                     LogMgr.e(TAG, "swallow local nlu without interrupt: " + sessionId + ", service=" + nlu.getService());
                     if (!active && !playingRemoteAudio && session == null) {
-                        ctx.enterWakeup(false);
+                        enterWakeup(ctx);
                         reset();
                     }
                     return;
@@ -204,7 +204,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         } else {
                             LogMgr.d(TAG, "single-turn mode, enter wakeup");
                             if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                                XiaoZhiHandler.this.ctx.enterWakeup(false);
+                                enterWakeup(XiaoZhiHandler.this.ctx);
                             }
                             reset();
                         }
@@ -216,7 +216,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         playingRemoteAudio = false;
                         session = null;
                         if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                            enterWakeup(XiaoZhiHandler.this.ctx);
                         }
                         reset();
                     }
@@ -237,7 +237,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         playingRemoteAudio = false;
                         session = null;
                         if (!interrupted && XiaoZhiHandler.this.ctx != null) {
-                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                            enterWakeup(XiaoZhiHandler.this.ctx);
                         }
                         reset();
                     }
@@ -260,7 +260,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
             return true;
         }
         LogMgr.d(TAG, "fallback tts end, enter wakeup");
-        ctx.enterWakeup(false);
+        enterWakeup(ctx);
         reset();
         return true;
     }
@@ -273,7 +273,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
             ctx.cancelTTS();
             cancelCurrentSession();
             if (!ExoConstants.DO_ONE_SHOT_INTERRUPT.equals(interruptType)) {
-                ctx.enterWakeup(false);
+                enterWakeup(ctx);
             }
             reset();
         }
@@ -296,7 +296,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         }
         if (this.bridgeManager != null && this.bridgeManager.hasServerCloseSince(serverCloseGeneration)) {
             LogMgr.d(TAG, "server closed during playback, stay wakeup");
-            targetCtx.enterWakeup(false);
+            enterWakeup(targetCtx);
             reset();
             return;
         }
@@ -317,7 +317,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                 }
                 if (bridgeManager != null && bridgeManager.hasServerCloseSince(serverCloseGeneration)) {
                     LogMgr.d(TAG, "server closed before enter ASR, stay wakeup");
-                    targetCtx.enterWakeup(false);
+                    enterWakeup(targetCtx);
                     reset();
                     return;
                 }
@@ -328,6 +328,13 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         }, "xiaozhi-enter-asr-delay");
         thread.setDaemon(true);
         thread.start();
+    }
+
+    private void enterWakeup(ANTHandlerContext ctx) {
+        if (this.bridgeManager != null) {
+            this.bridgeManager.closeUpstreamConnection();
+        }
+        ctx.enterWakeup(false);
     }
 
     private void configureContinuousAsrTimeouts(ANTHandlerContext ctx) {

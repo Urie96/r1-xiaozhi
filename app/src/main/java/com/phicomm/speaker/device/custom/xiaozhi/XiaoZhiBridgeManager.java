@@ -102,6 +102,10 @@ public final class XiaoZhiBridgeManager {
         upstream.cancelTurn(uuid);
     }
 
+    public void closeUpstreamConnection() {
+        upstream.closeConnection();
+    }
+
     public int serverCloseGeneration() {
         return serverCloseGeneration.get();
     }
