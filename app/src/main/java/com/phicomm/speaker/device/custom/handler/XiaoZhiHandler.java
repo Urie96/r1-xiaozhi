@@ -1,6 +1,7 @@
 package com.phicomm.speaker.device.custom.handler;
 
 import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiBridgeManager;
+import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiSettings;
 import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiStreamingSession;
 import com.phicomm.speaker.device.custom.xiaozhi.XiaoZhiTurn;
 import com.unisound.vui.engine.ANTEngineOption;
@@ -27,10 +28,11 @@ import nluparser.scheme.SName;
  */
 public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String TAG = "XiaoZhiHandler";
-    private static final long ENTER_ASR_DELAY_MS = 500L;
+    private static final int CONTINUOUS_ASR_MAX_DURATION_MS = 60000;
 
     private ANTHandlerContext ctx;
     private XiaoZhiBridgeManager bridgeManager;
+    private XiaoZhiSettings settings;
     private XiaoZhiStreamingSession session;
     private volatile boolean interrupted;
     private volatile boolean active;
@@ -50,9 +52,11 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
     public boolean onASREventEngineInitDone(ANTHandlerContext ctx) {
         this.ctx = ctx;
         this.bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
+        this.settings = this.bridgeManager.settings();
         this.bridgeManager.registerAntContext(ctx);
         this.bridgeManager.startLocalHttpServer();
-        com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil = 400;
+        com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutFrontSil = this.settings.vadFrontSilenceMs;
+        com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil = this.settings.vadBackSilenceMs;
         setNativeTRUrl(XiaoZhiBridgeManager.localTrAddr());
         return super.onASREventEngineInitDone(ctx);
     }
@@ -120,6 +124,10 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                 String sessionId = sessionIdFrom(nlu);
                 if (!isValidSessionId(sessionId)) {
                     LogMgr.e(TAG, "swallow local nlu without interrupt: " + sessionId + ", service=" + nlu.getService());
+                    if (!active && !playingRemoteAudio && session == null) {
+                        ctx.enterWakeup(false);
+                        reset();
+                    }
                     return;
                 }
             }
@@ -162,7 +170,7 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         cancelCurrentSession();
         ctx.stopWakeup();
         ctx.stopASR();
-        ctx.engine().config().setOption(ANTEngineOption.ASR_VAD_TIMEOUT_BACKSIL, 400);
+        configureContinuousAsrTimeouts(ctx);
 
         if (bridgeManager == null) {
             bridgeManager = XiaoZhiBridgeManager.get(ctx.androidContext());
@@ -191,15 +199,26 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                         LogMgr.d(TAG, "xiaozhi playback ended");
                         playingRemoteAudio = false;
                         session = null;
-                        enterASRAfterPlaybackSettled(serverCloseGeneration);
+                        if (settings != null && settings.multiTurnEnabled) {
+                            enterASRAfterPlaybackSettled(serverCloseGeneration);
+                        } else {
+                            LogMgr.d(TAG, "single-turn mode, enter wakeup");
+                            if (!interrupted && XiaoZhiHandler.this.ctx != null) {
+                                XiaoZhiHandler.this.ctx.enterWakeup(false);
+                            }
+                            reset();
+                        }
                     }
 
                     @Override
                     public void onNoAudio() {
-                        LogMgr.d(TAG, "xiaozhi no tts audio, enter ASR");
+                        LogMgr.d(TAG, "xiaozhi no tts audio, enter wakeup");
                         playingRemoteAudio = false;
                         session = null;
-                        enterASRAfterPlaybackSettled(serverCloseGeneration);
+                        if (!interrupted && XiaoZhiHandler.this.ctx != null) {
+                            XiaoZhiHandler.this.ctx.enterWakeup(false);
+                        }
+                        reset();
                     }
 
                     @Override
@@ -233,8 +252,15 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
         if (!this.eventReceived) {
             return super.onTTSEventPlayingEnd(ctx);
         }
-        LogMgr.d(TAG, "fallback tts end, enter ASR");
-        ctx.enterASR();
+        if (settings != null && settings.multiTurnEnabled) {
+            LogMgr.d(TAG, "fallback tts end, delay enter ASR");
+            enterASRAfterPlaybackSettled(bridgeManager == null
+                    ? 0
+                    : bridgeManager.serverCloseGeneration());
+            return true;
+        }
+        LogMgr.d(TAG, "fallback tts end, enter wakeup");
+        ctx.enterWakeup(false);
         reset();
         return true;
     }
@@ -279,7 +305,9 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
             @Override
             public void run() {
                 try {
-                    Thread.sleep(ENTER_ASR_DELAY_MS);
+                    Thread.sleep(settings == null
+                            ? XiaoZhiSettings.DEFAULT_ENTER_ASR_DELAY_MS
+                            : settings.enterAsrDelayMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -293,12 +321,31 @@ public class XiaoZhiHandler extends SimpleUserEventInboundHandler<NLU> {
                     reset();
                     return;
                 }
+                configureContinuousAsrTimeouts(targetCtx);
                 targetCtx.enterASR();
                 reset();
             }
         }, "xiaozhi-enter-asr-delay");
         thread.setDaemon(true);
         thread.start();
+    }
+
+    private void configureContinuousAsrTimeouts(ANTHandlerContext ctx) {
+        int frontSilenceMs = settings == null
+                ? XiaoZhiSettings.DEFAULT_VAD_FRONT_SILENCE_MS
+                : settings.vadFrontSilenceMs;
+        int backSilenceMs = settings == null
+                ? XiaoZhiSettings.DEFAULT_VAD_BACK_SILENCE_MS
+                : settings.vadBackSilenceMs;
+        ctx.engine().config().setOption(
+                ANTEngineOption.ASR_VAD_TIMEOUT_FRONTSIL,
+                frontSilenceMs);
+        ctx.engine().config().setOption(
+                ANTEngineOption.ASR_VAD_TIMEOUT_BACKSIL,
+                backSilenceMs);
+        ctx.engine().config().setOption(
+                ANTEngineOption.ASR_NET_TIMEOUT,
+                CONTINUOUS_ASR_MAX_DURATION_MS);
     }
 
     private void cancelCurrentSession() {

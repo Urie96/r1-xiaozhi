@@ -26,6 +26,7 @@ public class PhicommBindStatusHandler extends ANTOutboundHandlerAdapter {
         this.mContext = context;
         this.mANTEngine = engine;
         this.mLightController = new PhicommLightController(context);
+        UserPerferenceUtil.setDeviceBindState(context, true);
     }
 
     @Override // com.unisound.vui.engine.ANTOutboundHandlerAdapter, com.unisound.vui.engine.ANTOutboundHandler

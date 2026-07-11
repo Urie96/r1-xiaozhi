@@ -1,18 +1,122 @@
 # Local HTTP API
 
-R1 local HTTP server listens on `127.0.0.1:8089` and only accepts the canonical paths below. Removed aliases return `404`.
+R1 HTTP server listens on port `8089`. Open `http://<speaker-ip>:8089/` from a computer on the same network to use the built-in control page.
 
-## System
+The page is embedded in the injected Java code instead of APK assets because the Janus build preserves the signed ZIP body from `device_original.apk`; adding an asset would modify that signed body.
 
-### `GET /health`
+## Web Console
 
-Health probe.
+### `GET /`
 
-Response:
+### `GET /index.html`
+
+Both paths return the same self-contained HTML page. Its CSS and JavaScript are inline, and it uses relative `fetch` requests to read status, update configuration, and control the speaker.
+
+## Unified Status
+
+### `GET /api/status`
+
+This is the only GET API. It returns all status and saved configuration in one response:
 
 ```json
-{"status":"ok"}
+{
+  "ok": true,
+  "config": {
+    "vadFrontSilenceMs": 20000,
+    "vadBackSilenceMs": 400,
+    "wsUrl": "ws://home.lubui.com:3116/ws",
+    "enterAsrDelayMs": 500,
+    "multiTurnEnabled": true,
+    "restartRequired": false
+  },
+  "bluetooth": {
+    "ok": true,
+    "action": "status",
+    "supported": true,
+    "adapterEnabled": false,
+    "adapterState": 10,
+    "bluetoothMode": false
+  },
+  "volume": {
+    "ok": true,
+    "action": "status",
+    "current": 7,
+    "max": 15,
+    "percent": 47
+  },
+  "asr": {
+    "ok": true,
+    "action": "status",
+    "contextReady": true,
+    "engineState": 0,
+    "wakeup": true,
+    "asr": false,
+    "recognition": false,
+    "ttsPlaying": false
+  },
+  "sleep": {
+    "ok": true,
+    "action": "status",
+    "sleeping": false,
+    "deviceStatus": 0,
+    "contextReady": true
+  }
+}
 ```
+
+The old GET APIs `/health`, `/api/config`, `/api/bluetooth`, `/api/volume`, `/api/asr`, and `/api/sleep` have been removed and return `404`.
+
+## XiaoZhi Configuration
+
+### `POST /api/config`
+
+Validates and persists a partial JSON object. Configuration is loaded when the APK process starts, so restart the process or device when `restartRequired` is `true`.
+
+| Field | Range / default | Description |
+| --- | --- | --- |
+| `vadFrontSilenceMs` | `1000–120000`, default `20000` | Maximum silence before the user starts speaking. |
+| `vadBackSilenceMs` | `100–5000`, default `400` | Silence used to detect the end of speech. |
+| `wsUrl` | default `ws://home.lubui.com:3116/ws` | XiaoZhi WebSocket URL using `ws`, `wss`, `http`, or `https`. |
+| `enterAsrDelayMs` | `0–10000`, default `500` | Delay before entering ASR after playback in multi-turn mode. |
+| `multiTurnEnabled` | default `true` | Enters ASR after playback when true; returns to wakeup when false. |
+
+Unknown fields and invalid values return `400`; no settings are saved unless the entire request is valid.
+
+```sh
+curl -X POST http://<speaker-ip>:8089/api/config \
+  -H 'Content-Type: application/json' \
+  -d '{"vadFrontSilenceMs":15000,"vadBackSilenceMs":600,"multiTurnEnabled":false}'
+```
+
+## Speaker Controls
+
+### Bluetooth
+
+- `POST /api/bluetooth/on` enables the adapter when needed and enters R1 Bluetooth mode through the original triple-click path.
+- `POST /api/bluetooth/off` leaves R1 Bluetooth mode without force-disabling the Android adapter.
+
+### Volume
+
+- `POST /api/volume/up` raises volume one step.
+- `POST /api/volume/down` lowers volume one step.
+- `POST /api/volume/max` sets maximum volume.
+- `POST /api/volume/min` sets minimum volume.
+- `POST /api/volume/set` accepts query `level=<n>` or `percent=<n>`, or JSON `{ "level": n }` / `{ "percent": n }`.
+
+```sh
+curl -X POST 'http://<speaker-ip>:8089/api/volume/set?percent=40'
+```
+
+### ASR
+
+- `POST /api/asr/wakeup` triggers `ExoConstants.DO_ENTER_ASR_BY_MIC` on the ANT pipeline. It returns `503` when the ANT context is not ready.
+
+### Sleep
+
+- `POST /api/sleep/start` starts sleep through the original double-click path.
+- `POST /api/sleep/end` ends sleep through the original one-click path.
+
+The original sleep state transition is asynchronous. Refresh `GET /api/status` to confirm the settled state.
 
 ## R1 ASR Traffic Router
 
@@ -20,126 +124,10 @@ Response:
 
 Compatibility endpoint used by the original R1 native ASR pipeline. It accepts the original traffic-router request format and forwards captured Opus frames to the XiaoZhi upstream session.
 
-Headers used by the bridge:
-
-| Header | Description |
-| --- | --- |
-| `UI` | Device id. Defaults to `feixun-r1` when missing. |
-| `P` | Original traffic-router parameter header. The bridge extracts `SID` from the first bracket pair. |
-
-Request body behavior:
-
 | Body | Behavior |
 | --- | --- |
-| Empty body, no active session | Starts an upstream turn and returns the original-style init ack. |
-| Non-empty body | Treats body as length-prefixed R1 Opus frames and forwards frames upstream. |
-| Empty body, active session exists | Finishes the upstream turn and returns a fake NLU payload containing the upstream turn UUID. |
+| Empty body, no active session | Starts an upstream turn and returns the original-style init acknowledgement. |
+| Non-empty body | Treats the body as length-prefixed R1 Opus frames and forwards them upstream. |
+| Empty body, active session exists | Finishes the upstream turn and returns a fake NLU payload containing the turn UUID. |
 
-## Bluetooth
-
-### `GET /api/bluetooth`
-
-Returns Bluetooth adapter and R1 Bluetooth mode status.
-
-Response fields:
-
-| Field | Description |
-| --- | --- |
-| `ok` | Whether the request succeeded. |
-| `action` | `status`. |
-| `supported` | Whether Android has a Bluetooth adapter. |
-| `adapterEnabled` | Present when an adapter exists. |
-| `adapterState` | Present when an adapter exists. Android adapter state integer. |
-| `bluetoothMode` | Whether the R1 device status is Bluetooth mode. |
-| `error` | Present on failure. |
-
-### `POST /api/bluetooth/on`
-
-Enters R1 Bluetooth mode through the original triple-click control path and enables the adapter when needed.
-
-### `POST /api/bluetooth/off`
-
-Leaves R1 Bluetooth mode through the original device control path. It does not force-disable the Android adapter.
-
-Bluetooth action responses include the status fields above plus `requestedBluetoothMode`.
-
-## Volume
-
-### `GET /api/volume`
-
-Returns current volume status.
-
-Response fields:
-
-| Field | Description |
-| --- | --- |
-| `ok` | Whether the request succeeded. |
-| `action` | `status`, `up`, `down`, `max`, `min`, or `set`. |
-| `current` | Current Android volume level. |
-| `max` | Maximum Android volume level. |
-| `percent` | Current volume as an integer percentage. |
-| `requestedLevel` | Present when an absolute level was requested. |
-| `requestedPercent` | Present when a percentage was requested. |
-| `error` | Present on failure. |
-
-### `POST /api/volume/up`
-
-Raises volume by one original volume step.
-
-### `POST /api/volume/down`
-
-Lowers volume by one original volume step.
-
-### `POST /api/volume/max`
-
-Sets volume to maximum.
-
-### `POST /api/volume/min`
-
-Sets volume to minimum.
-
-### `POST /api/volume/set`
-
-Sets volume by absolute level or percentage.
-
-Accepted inputs:
-
-| Input | Description |
-| --- | --- |
-| Query `level=<n>` | Absolute Android volume level. Must be between `1` and `max`. |
-| Query `percent=<n>` | Percent volume. Must be between `0` and `100`. |
-| JSON body `{ "level": n }` | Absolute Android volume level. |
-| JSON body `{ "percent": n }` | Percent volume. |
-
-Example:
-
-```sh
-curl -X POST 'http://127.0.0.1:8089/api/volume/set?percent=40'
-```
-
-## ASR
-
-### `GET /api/asr`
-
-Returns ANT engine readiness and speech state.
-
-Response fields:
-
-| Field | Description |
-| --- | --- |
-| `ok` | Whether the request succeeded. |
-| `action` | `status` or `wakeupAsr`. |
-| `contextReady` | Whether the bridge has received an `ANTHandlerContext`. |
-| `engineState` | Present when context is ready. Original ANT engine state. |
-| `wakeup` | Present when context is ready. Whether wakeup is active. |
-| `asr` | Present when context is ready. Whether ASR is active. |
-| `recognition` | Present when context is ready. Whether recognition is active. |
-| `ttsPlaying` | Present when context is ready. Whether TTS is playing. |
-| `stateError` | Present if engine state reading fails. |
-| `error` | Present on request failure. |
-
-### `POST /api/asr/wakeup`
-
-Triggers `ExoConstants.DO_ENTER_ASR_BY_MIC` on the ANT pipeline to enter microphone ASR.
-
-Returns `503` when the ANT context has not been registered yet.
+The `UI` header supplies the device ID and defaults to `feixun-r1`. The bridge extracts the session ID from the first bracket pair in the original `P` header.

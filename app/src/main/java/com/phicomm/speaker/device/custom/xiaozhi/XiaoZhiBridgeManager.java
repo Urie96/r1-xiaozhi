@@ -30,9 +30,12 @@ public final class XiaoZhiBridgeManager {
     private static final String LOCAL_TR_ADDR = "127.0.0.1:8089";
     private static final int LOCAL_TR_PORT = 8089;
     private static final int MAX_BODY_BYTES = 2 * 1024 * 1024;
+    private static final String DEFAULT_WS_URL = "ws://home.lubui.com:3116/ws";
     private static XiaoZhiBridgeManager instance;
 
     private final Context context;
+    private final XiaoZhiSettings settings;
+    private final String defaultWsUrl;
     private final XiaoZhiUpstreamClient upstream;
     private final PhicommXController phicommXController;
     private final Map<String, ActiveSession> active = new HashMap<String, ActiveSession>();
@@ -42,7 +45,9 @@ public final class XiaoZhiBridgeManager {
 
     private XiaoZhiBridgeManager(Context context) {
         this.context = context;
-        this.upstream = new XiaoZhiUpstreamClient(config("xiaozhi_ws", "ws://home.lubui.com:3116/ws"), config("xiaozhi_token", "dev-token"), new XiaoZhiUpstreamClient.ConversationCloseListener() {
+        this.defaultWsUrl = config("xiaozhi_ws", DEFAULT_WS_URL);
+        this.settings = XiaoZhiSettings.load(context, this.defaultWsUrl);
+        this.upstream = new XiaoZhiUpstreamClient(this.settings.wsUrl, config("xiaozhi_token", "dev-token"), new XiaoZhiUpstreamClient.ConversationCloseListener() {
             @Override
             public void onConversationClosed() {
                 enterWakeupFromServerClose();
@@ -60,6 +65,10 @@ public final class XiaoZhiBridgeManager {
 
     public static String localTrAddr() {
         return LOCAL_TR_ADDR;
+    }
+
+    public XiaoZhiSettings settings() {
+        return settings;
     }
 
     public void registerAntContext(ANTHandlerContext ctx) {
@@ -179,8 +188,14 @@ public final class XiaoZhiBridgeManager {
         if ("POST".equals(request.method) && "/trafficRouter/cs".equals(path)) {
             return handleTraffic(request);
         }
-        if ("GET".equals(request.method) && "/health".equals(path)) {
-            return new Response(200, null, null, null, null, "{\"status\":\"ok\"}".getBytes("UTF-8"));
+        if ("GET".equals(request.method) && ("/".equals(path) || "/index.html".equals(path))) {
+            return new Response(200, null, null, null, null, XiaoZhiIndexPage.bytes(), "text/html; charset=UTF-8");
+        }
+        if ("GET".equals(request.method) && "/api/status".equals(path)) {
+            return handleStatus();
+        }
+        if ("POST".equals(request.method) && "/api/config".equals(path)) {
+            return handleConfig(request);
         }
         if (isBluetoothRoute(request.method, path)) {
             return handleBluetooth(path);
@@ -191,7 +206,54 @@ public final class XiaoZhiBridgeManager {
         if (isAsrRoute(request.method, path)) {
             return handleAsr(path);
         }
+        if (isSleepRoute(request.method, path)) {
+            return handleSleep(path);
+        }
         return new Response(404, null, null, null, null, new byte[0]);
+    }
+
+    private Response handleStatus() throws Exception {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("ok", true);
+            json.put("config", configStatusJson());
+            json.put("bluetooth", bluetoothStatusJson("status", null, true, null));
+            json.put("volume", volumeStatusJson("status", null, null, true, null));
+            json.put("asr", asrStatusJson("status", true, null));
+            json.put("sleep", sleepStatusJson("status", true, null));
+            return jsonResponse(200, json);
+        } catch (Exception e) {
+            JSONObject json = new JSONObject();
+            json.put("ok", false);
+            json.put("error", e.getMessage() == null ? e.toString() : e.getMessage());
+            return jsonResponse(500, json);
+        }
+    }
+
+    private JSONObject configStatusJson() throws Exception {
+        XiaoZhiSettings saved = XiaoZhiSettings.load(this.context, this.defaultWsUrl);
+        JSONObject json = saved.toJson();
+        json.put("restartRequired", !this.settings.sameAs(saved));
+        return json;
+    }
+
+    private Response handleConfig(Request request) throws Exception {
+        try {
+            if (request.body.length == 0) {
+                throw new IllegalArgumentException("request body is required");
+            }
+            XiaoZhiSettings saved = XiaoZhiSettings.update(this.context, this.defaultWsUrl,
+                    new JSONObject(new String(request.body, "UTF-8")));
+            JSONObject json = saved.toJson();
+            json.put("ok", true);
+            json.put("restartRequired", !this.settings.sameAs(saved));
+            return jsonResponse(200, json);
+        } catch (Exception e) {
+            JSONObject json = new JSONObject();
+            json.put("ok", false);
+            json.put("error", e.getMessage() == null ? e.toString() : e.getMessage());
+            return jsonResponse(400, json);
+        }
     }
 
     private Response handleTraffic(Request request) throws Exception {
@@ -229,10 +291,6 @@ public final class XiaoZhiBridgeManager {
     }
 
     private Response handleBluetooth(String path) throws Exception {
-        if (isPath(path, "/api/bluetooth")) {
-            return bluetoothStatusResponse("status", null, true, null);
-        }
-
         boolean enable;
         String action;
         if (isPath(path, "/api/bluetooth/on")) {
@@ -273,6 +331,12 @@ public final class XiaoZhiBridgeManager {
     }
 
     private Response bluetoothStatusResponse(String action, Boolean requestedBluetoothMode, boolean ok, String error) throws Exception {
+        return jsonResponse(ok ? 200 : 500,
+                bluetoothStatusJson(action, requestedBluetoothMode, ok, error));
+    }
+
+    private JSONObject bluetoothStatusJson(String action, Boolean requestedBluetoothMode,
+                                           boolean ok, String error) throws Exception {
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         JSONObject json = new JSONObject();
         json.put("ok", ok);
@@ -289,7 +353,7 @@ public final class XiaoZhiBridgeManager {
         if (error != null) {
             json.put("error", error);
         }
-        return new Response(ok ? 200 : 500, null, null, null, null, json.toString().getBytes("UTF-8"));
+        return json;
     }
 
     private boolean isBluetoothMode() {
@@ -301,11 +365,58 @@ public final class XiaoZhiBridgeManager {
         }
     }
 
-    private Response handleAsr(String path) throws Exception {
-        if (isPath(path, "/api/asr")) {
-            return asrStatusResponse("status", true, null, 200);
+    private Response handleSleep(String path) throws Exception {
+        boolean sleep;
+        String action;
+        if (isPath(path, "/api/sleep/start")) {
+            sleep = true;
+            action = "start";
+        } else if (isPath(path, "/api/sleep/end")) {
+            sleep = false;
+            action = "end";
+        } else {
+            return new Response(404, null, null, null, null, new byte[0]);
         }
 
+        try {
+            boolean sleeping = isSleeping();
+            if (sleep && !sleeping) {
+                this.phicommXController.triggeredDoubleClickEvent();
+            } else if (!sleep && sleeping) {
+                this.phicommXController.triggeredOneClickEvent();
+            }
+            LogMgr.d(TAG, "sleep api action=" + action + ", previousSleeping=" + sleeping);
+            return sleepStatusResponse(action, true, null, 200);
+        } catch (Throwable t) {
+            String error = t.toString();
+            LogMgr.e(TAG, "sleep api failed action=" + action + ": " + error);
+            return sleepStatusResponse(action, false, error, 500);
+        }
+    }
+
+    private Response sleepStatusResponse(String action, boolean ok, String error, int status) throws Exception {
+        return jsonResponse(status, sleepStatusJson(action, ok, error));
+    }
+
+    private JSONObject sleepStatusJson(String action, boolean ok, String error) throws Exception {
+        JSONObject json = new JSONObject();
+        json.put("ok", ok);
+        json.put("action", action);
+        json.put("sleeping", isSleeping());
+        json.put("deviceStatus", PhicommDeviceStatusProcessor.getInstance().getDeviceStatus());
+        json.put("contextReady", this.antContext != null);
+        if (error != null) {
+            json.put("error", error);
+        }
+        return json;
+    }
+
+    private boolean isSleeping() {
+        return PhicommDeviceStatusProcessor.getInstance().getDeviceStatus()
+                == PhicommDeviceStatusProcessor.STATUS_DORMANT;
+    }
+
+    private Response handleAsr(String path) throws Exception {
         if (isPath(path, "/api/asr/wakeup")) {
             ANTHandlerContext ctx = this.antContext;
             if (ctx == null) {
@@ -326,6 +437,10 @@ public final class XiaoZhiBridgeManager {
     }
 
     private Response asrStatusResponse(String action, boolean ok, String error, int status) throws Exception {
+        return jsonResponse(status, asrStatusJson(action, ok, error));
+    }
+
+    private JSONObject asrStatusJson(String action, boolean ok, String error) throws Exception {
         ANTHandlerContext ctx = this.antContext;
         JSONObject json = new JSONObject();
         json.put("ok", ok);
@@ -346,16 +461,12 @@ public final class XiaoZhiBridgeManager {
         if (error != null) {
             json.put("error", error);
         }
-        return new Response(status, null, null, null, null, json.toString().getBytes("UTF-8"));
+        return json;
     }
 
     private Response handleVolume(Request request) throws Exception {
         String path = pathOnly(request.path);
         DefaultVolumeOperator volumeOperator = DefaultVolumeOperator.getInstance(this.context);
-        if (isPath(path, "/api/volume")) {
-            return volumeResponse("status", null, null, true, null, 200);
-        }
-
         if (isPath(path, "/api/volume/up")) {
             volumeOperator.setVolumeRaise();
             return volumeResponse("up", null, null, true, null, 200);
@@ -422,6 +533,12 @@ public final class XiaoZhiBridgeManager {
 
     private Response volumeResponse(String action, Integer requestedLevel, Integer requestedPercent,
                                     boolean ok, String error, int status) throws Exception {
+        return jsonResponse(status,
+                volumeStatusJson(action, requestedLevel, requestedPercent, ok, error));
+    }
+
+    private JSONObject volumeStatusJson(String action, Integer requestedLevel, Integer requestedPercent,
+                                        boolean ok, String error) throws Exception {
         DefaultVolumeOperator volumeOperator = DefaultVolumeOperator.getInstance(this.context);
         int current = volumeOperator.getCurrentVolume();
         int max = volumeOperator.getMaxVolume();
@@ -440,7 +557,7 @@ public final class XiaoZhiBridgeManager {
         if (error != null) {
             json.put("error", error);
         }
-        return new Response(status, null, null, null, null, json.toString().getBytes("UTF-8"));
+        return json;
     }
 
     private static String queryParam(String target, String name) {
@@ -463,19 +580,22 @@ public final class XiaoZhiBridgeManager {
     }
 
     private static boolean isBluetoothRoute(String method, String path) {
-        return ("GET".equals(method) && path.equals("/api/bluetooth"))
-                || ("POST".equals(method) && (path.equals("/api/bluetooth/on") || path.equals("/api/bluetooth/off")));
+        return "POST".equals(method)
+                && (path.equals("/api/bluetooth/on") || path.equals("/api/bluetooth/off"));
     }
 
     private static boolean isVolumeRoute(String method, String path) {
-        return ("GET".equals(method) && path.equals("/api/volume"))
-                || ("POST".equals(method) && (path.equals("/api/volume/up") || path.equals("/api/volume/down")
-                || path.equals("/api/volume/max") || path.equals("/api/volume/min") || path.equals("/api/volume/set")));
+        return "POST".equals(method) && (path.equals("/api/volume/up") || path.equals("/api/volume/down")
+                || path.equals("/api/volume/max") || path.equals("/api/volume/min") || path.equals("/api/volume/set"));
     }
 
     private static boolean isAsrRoute(String method, String path) {
-        return ("GET".equals(method) && path.equals("/api/asr"))
-                || ("POST".equals(method) && path.equals("/api/asr/wakeup"));
+        return "POST".equals(method) && path.equals("/api/asr/wakeup");
+    }
+
+    private static boolean isSleepRoute(String method, String path) {
+        return "POST".equals(method)
+                && (path.equals("/api/sleep/start") || path.equals("/api/sleep/end"));
     }
 
     private static boolean isPath(String path, String expect) {
@@ -632,12 +752,20 @@ public final class XiaoZhiBridgeManager {
         return new Response(200, sid, pn, ct, rs, body);
     }
 
+    private static Response jsonResponse(int status, JSONObject json) throws Exception {
+        return new Response(status, null, null, null, null,
+                json.toString().getBytes("UTF-8"), "application/json; charset=UTF-8");
+    }
+
     private static void writeResponse(OutputStream out, Response response, boolean keepAlive) throws IOException {
         byte[] body = response.body == null ? new byte[0] : response.body;
         StringBuilder sb = new StringBuilder();
         sb.append("HTTP/1.1 ").append(response.status).append(" \r\n");
         sb.append("Access-Control-Allow-Credentials: true\r\n");
         sb.append("Access-Control-Allow-Origin: *\r\n");
+        if (response.contentType != null) {
+            sb.append("Content-Type: ").append(response.contentType).append("\r\n");
+        }
         if (response.ct != null) {
             sb.append("CT: ").append(response.ct).append("\r\n");
         }
@@ -764,14 +892,21 @@ public final class XiaoZhiBridgeManager {
         final String ct;
         final String rs;
         final byte[] body;
+        final String contentType;
 
         Response(int status, String sid, String pn, String ct, String rs, byte[] body) {
+            this(status, sid, pn, ct, rs, body, null);
+        }
+
+        Response(int status, String sid, String pn, String ct, String rs, byte[] body,
+                 String contentType) {
             this.status = status;
             this.sid = sid;
             this.pn = pn;
             this.ct = ct;
             this.rs = rs;
             this.body = body;
+            this.contentType = contentType;
         }
     }
 }

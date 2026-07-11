@@ -19,8 +19,8 @@ fail() {
   exit 1
 }
 
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
 # ── Arguments ─────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -85,12 +85,12 @@ info "Cleaning up temporary file on device…"
 $ADB shell "rm -f \"${REMOTE_PATH}\" && sync" || warn "Cleanup failed (non-fatal)"
 
 # ── Dalvik-cache wipe ────────────────────────
-info "Clearing dalvik-cache…"
-$ADB shell 'for d in /data/dalvik-cache/arm /data/dalvik-cache/arm64; do
-  if [ -d "$d" ]; then
-    rm -rf "${d:?}"/* && echo "Cleared $d"
-  fi
-done && sync' || warn "Dalvik-cache cleanup failed (non-fatal)"
+# info "Clearing dalvik-cache…"
+# $ADB shell 'for d in /data/dalvik-cache/arm /data/dalvik-cache/arm64; do
+#   if [ -d "$d" ]; then
+#     rm -rf "${d:?}"/* && echo "Cleared $d"
+#   fi
+# done && sync' || warn "Dalvik-cache cleanup failed (non-fatal)"
 
 # ── Check result ─────────────────────────────
 if echo "$INSTALL_OUT" | grep -qiE '(failure|error)'; then
